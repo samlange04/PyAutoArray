@@ -30,8 +30,8 @@ class AbstractMeshGeometry:
         # (the Bilinear meshes) — must match the mapper's transform so the
         # geometry is consistent with where the mapper scatters its flux.
         self.transform = transform
-        # Kernel forward evaluation ("exact" / "tabulated") and its table
-        # size; None falls back to the kernel defaults.
+        # Explicit kernel forward evaluation ("exact" / "tabulated") and table
+        # size; None (the usual case) means the rtu_forward config.
         self.kernel_forward = kernel_forward
         self.kernel_forward_knots = kernel_forward_knots
         self._use_jax = xp is not np
