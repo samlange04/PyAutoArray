@@ -19,11 +19,13 @@ from autoarray.inversion.mesh.interpolator.rectangular import (
     KERNEL_CDF_DEFAULT_KNOTS,
     KERNEL_FORWARD_BLOCK,
     KERNEL_FORWARD_DEFAULT,
+    KERNEL_FORWARD_DEFAULT_KNOTS,
     InterpolatorRectangular,
     adaptive_rectangular_areas_from,
     adaptive_rectangular_mappings_weights_via_interpolation_from,
     create_transforms,
     create_transforms_rank,
+    kernel_forward_from_config,
 )
 
 
@@ -610,9 +612,54 @@ def test__forward_transform__windowed_numba_matches_dense_reference(weighted):
 
 
 def test__create_transforms__forward_default_is_exact():
+    # The test config pushes one dir without the rtu_forward keys, so the
+    # fallbacks resolve, and they must be the packaged defaults.
     assert KERNEL_FORWARD_DEFAULT == "exact"
-    mesh = aa.mesh.RectangularRTUAdaptDensity(shape=(4, 4))
-    assert mesh.forward == "exact"
+    assert kernel_forward_from_config() == ("exact", KERNEL_FORWARD_DEFAULT_KNOTS)
+
+    data_grid, data_grid_over, _ = _seeded_inputs()
+    fwd_default, _ = create_transforms(data_grid, mesh_pixels=8, xp=np)
+    fwd_exact, _ = create_transforms(data_grid, mesh_pixels=8, forward="exact", xp=np)
+    np.testing.assert_array_equal(fwd_default(data_grid_over), fwd_exact(data_grid_over))
+
+
+def test__create_transforms__forward_read_from_config():
+    from autonerves import conf
+
+    data_grid, data_grid_over, _ = _seeded_inputs(M=300, K=800, seed=21)
+    inversion = conf.instance["general"]["inversion"]
+    try:
+        inversion["rtu_forward"] = "tabulated"
+        inversion["rtu_forward_knots"] = 48
+        assert kernel_forward_from_config() == ("tabulated", 48)
+
+        fwd_config, _ = create_transforms(data_grid, mesh_pixels=8, xp=np)
+        fwd_explicit, _ = create_transforms(
+            data_grid, mesh_pixels=8, forward="tabulated", n_forward_knots=48, xp=np
+        )
+        fwd_exact, _ = create_transforms(data_grid, mesh_pixels=8, forward="exact", xp=np)
+
+        # The config value drives the default call, bit for bit ...
+        np.testing.assert_array_equal(
+            fwd_config(data_grid_over), fwd_explicit(data_grid_over)
+        )
+        # ... and a coarse table is visibly not the exact transform, so the
+        # equality above is not vacuous.
+        assert np.max(np.abs(fwd_config(data_grid_over) - fwd_exact(data_grid_over))) > 1e-9
+
+        # The mesh / interpolator route reads the same config (no mesh argument).
+        mesh = aa.mesh.RectangularRTUAdaptDensity(shape=(8, 8))
+        assert "forward" not in mesh.interpolator_kwargs
+        grid = aa.Grid2DIrregular(values=data_grid)
+        interpolator = mesh.interpolator_cls(
+            mesh=mesh, mesh_grid=grid, data_grid=grid, mesh_weight_map=None,
+            **mesh.interpolator_kwargs, xp=np,
+        )
+        assert interpolator.forward is None
+        assert interpolator.mesh_geometry.kernel_forward is None
+    finally:
+        inversion["rtu_forward"] = "exact"
+        inversion["rtu_forward_knots"] = KERNEL_FORWARD_DEFAULT_KNOTS
 
 
 def test__create_transforms__invalid_forward_raises():
@@ -727,18 +774,19 @@ def test__mappings_sizes_weights__tabulated_forward_matches_exact():
     )
 
 
-def test__InterpolatorRectangular__tabulated_forward_threads_to_geometry():
+def test__InterpolatorRectangular__explicit_forward_threads_to_geometry():
+    # An explicit override (tests, benchmarks) bypasses the config and reaches
+    # the geometry's areas / edges transform too.
     data_grid, _, _ = _seeded_inputs(M=200, K=800, seed=13)
-    mesh = aa.mesh.RectangularRTUAdaptDensity(
-        shape=(8, 8), forward="tabulated", n_forward_knots=1024
-    )
+    mesh = aa.mesh.RectangularRTUAdaptDensity(shape=(8, 8))
     grid = aa.Grid2DIrregular(values=data_grid)
-    interpolator = mesh.interpolator_cls(
+    interpolator = InterpolatorRectangular(
         mesh=mesh,
         mesh_grid=grid,
         data_grid=grid,
         mesh_weight_map=None,
-        **mesh.interpolator_kwargs,
+        forward="tabulated",
+        n_forward_knots=1024,
         xp=np,
     )
     geometry = interpolator.mesh_geometry

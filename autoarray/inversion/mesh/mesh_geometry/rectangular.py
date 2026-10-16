@@ -490,8 +490,6 @@ class MeshGeometryRectangular(AbstractMeshGeometry):
         from autoarray.inversion.mesh.interpolator.rectangular import (
             KERNEL_CDF_DEFAULT_BANDWIDTH,
             KERNEL_CDF_DEFAULT_KNOTS,
-            KERNEL_FORWARD_DEFAULT,
-            KERNEL_FORWARD_DEFAULT_KNOTS,
             adaptive_rectangular_transformed_grid_from,
         )
 
@@ -505,17 +503,6 @@ class MeshGeometryRectangular(AbstractMeshGeometry):
             if self.kernel_knots is not None
             else KERNEL_CDF_DEFAULT_KNOTS
         )
-        forward = (
-            self.kernel_forward
-            if self.kernel_forward is not None
-            else KERNEL_FORWARD_DEFAULT
-        )
-        n_forward_knots = (
-            self.kernel_forward_knots
-            if self.kernel_forward_knots is not None
-            else KERNEL_FORWARD_DEFAULT_KNOTS
-        )
-
         return adaptive_rectangular_transformed_grid_from(
             data_grid=self.data_grid.array,
             grid=edges_reshaped,
@@ -524,8 +511,9 @@ class MeshGeometryRectangular(AbstractMeshGeometry):
             bandwidth=bandwidth,
             n_knots=n_knots,
             transform=self.transform,
-            forward=forward,
-            n_forward_knots=n_forward_knots,
+            # None = the rtu_forward / rtu_forward_knots config (see create_transforms).
+            forward=self.kernel_forward,
+            n_forward_knots=self.kernel_forward_knots,
             xp=self._xp,
         )
 

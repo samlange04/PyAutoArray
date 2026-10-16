@@ -6,8 +6,6 @@ import autoarray as aa
 from autoarray.inversion.mesh.interpolator.rectangular import (
     KERNEL_CDF_DEFAULT_BANDWIDTH,
     KERNEL_CDF_DEFAULT_KNOTS,
-    KERNEL_FORWARD_DEFAULT,
-    KERNEL_FORWARD_DEFAULT_KNOTS,
     InterpolatorRectangular,
 )
 from autoarray.inversion.mesh.interpolator.rectangular_uniform import (
@@ -198,7 +196,7 @@ def test__construction__minimum_shape_raises():
 
 def test__interpolator_cls_and_kwargs():
     density = aa.mesh.RectangularRTUAdaptDensity(
-        shape=(3, 3), bandwidth=0.5, n_knots=128, forward="tabulated", n_forward_knots=2048
+        shape=(3, 3), bandwidth=0.5, n_knots=128
     )
     image = aa.mesh.RectangularRTUAdaptImage(shape=(3, 3))
     uniform = aa.mesh.RectangularUniform(shape=(3, 3))
@@ -207,17 +205,12 @@ def test__interpolator_cls_and_kwargs():
     assert image.interpolator_cls is InterpolatorRectangular
     assert uniform.interpolator_cls is InterpolatorRectangularUniform
 
-    assert density.interpolator_kwargs == {
-        "bandwidth": 0.5,
-        "n_knots": 128,
-        "forward": "tabulated",
-        "n_forward_knots": 2048,
-    }
+    # The RTU forward switch is config (rtu_forward), not a mesh argument, so it must
+    # not appear here: a new constructor argument would change every RTU search identifier.
+    assert density.interpolator_kwargs == {"bandwidth": 0.5, "n_knots": 128}
     assert image.interpolator_kwargs == {
         "bandwidth": KERNEL_CDF_DEFAULT_BANDWIDTH,
         "n_knots": KERNEL_CDF_DEFAULT_KNOTS,
-        "forward": KERNEL_FORWARD_DEFAULT,
-        "n_forward_knots": KERNEL_FORWARD_DEFAULT_KNOTS,
     }
     # The uniform interpolator's constructor takes no kernel arguments.
     assert uniform.interpolator_kwargs == {}

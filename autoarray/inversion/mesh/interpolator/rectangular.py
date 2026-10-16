@@ -143,16 +143,48 @@ KERNEL_FORWARD_BLOCK: int = 512
 # drops by M_sub / n_forward_knots. The Hermite segment keeps the transform C1
 # in the queries (the traced points, which move with the mass model) and the
 # knot values are exact kernel sums, so it stays C-infinity in the data
-# points. The default stays ``"exact"`` so no existing result or regression
-# pin changes; the tabulated forward is an opt-in for fp64-weak GPUs where
-# the exact O(M_sub x N_data) sum dominates the likelihood. 1024 knots per
-# axis interpolates the CDF to ~1e-10 of the unit square (16x better per
-# doubling); on an HST fit (N = 15.4k, M_sub = 63k, 30-pixel mesh, RTX A6000,
-# float64) the per-likelihood cost fell from 558 ms to 143-148 ms at 256-1024
-# knots, with the remainder being the rest of the likelihood, so more knots
-# only add table cost (219 ms at 8192).
+# points.
+#
+# The switch is a *config setting*, not a mesh argument: ``general.yaml``
+# ``[inversion] rtu_forward`` (``"exact"`` / ``"tabulated"``) and
+# ``rtu_forward_knots``. A mesh constructor argument would enter every RTU
+# model's search identifier (``af.Model`` records every constructor argument
+# name), so completed fits would stop resuming after an upgrade; a config value
+# is identifier-neutral, like the pixelization over-sampling, which is right
+# for a numerical-evaluation choice that leaves the model unchanged. The two
+# constants below are the fallbacks when a config lacks the keys. The packaged
+# default is ``"exact"`` so no existing result or regression pin changes; the
+# tabulated forward is an opt-in for fp64-weak GPUs where the exact
+# O(M_sub x N_data) sum dominates the likelihood. 1024 knots per axis
+# interpolates the CDF to ~1e-10 of the unit square (16x better per doubling);
+# on an HST fit (N = 15.4k, M_sub = 63k, 30-pixel mesh, RTX A6000, float64) the
+# per-likelihood cost fell from 558 ms to 143-148 ms at 256-1024 knots, with
+# the remainder being the rest of the likelihood, so more knots only add table
+# cost (219 ms at 8192).
 KERNEL_FORWARD_DEFAULT: str = "exact"
 KERNEL_FORWARD_DEFAULT_KNOTS: int = 1024
+
+
+def kernel_forward_from_config():
+    """
+    The kernel forward evaluation from ``general.yaml`` ``[inversion]``:
+    ``(rtu_forward, rtu_forward_knots)``. A workspace ``general.yaml`` normally
+    omits newer keys and autoconf falls through to autoarray's packaged value;
+    the fallback here fires only when a workspace config is the sole config
+    path (isolated test configs push one dir) and returns the same packaged
+    values, so both routes resolve identically.
+    """
+    from autonerves import conf
+
+    try:
+        forward = conf.instance["general"]["inversion"]["rtu_forward"]
+    except KeyError:
+        forward = KERNEL_FORWARD_DEFAULT
+    try:
+        n_knots = conf.instance["general"]["inversion"]["rtu_forward_knots"]
+    except KeyError:
+        n_knots = KERNEL_FORWARD_DEFAULT_KNOTS
+    return str(forward), int(n_knots)
 
 _SQRT2 = np.sqrt(2.0)
 
@@ -324,8 +356,8 @@ def create_transforms(
     mesh_weight_map=None,
     bandwidth: float = KERNEL_CDF_DEFAULT_BANDWIDTH,
     n_knots: int = KERNEL_CDF_DEFAULT_KNOTS,
-    forward: str = KERNEL_FORWARD_DEFAULT,
-    n_forward_knots: int = KERNEL_FORWARD_DEFAULT_KNOTS,
+    forward: Optional[str] = None,
+    n_forward_knots: Optional[int] = None,
     xp=np,
 ):
     """
@@ -354,15 +386,23 @@ def create_transforms(
         Size of the fixed knot table used to invert the CDF.
     forward
         How the forward transform is evaluated at the query points:
-        ``"exact"`` (the kernel sum at every query, the default) or
-        ``"tabulated"`` (cubic Hermite interpolation of the exact CDF and
-        kernel density on ``n_forward_knots`` uniform knots per axis; see
-        ``KERNEL_FORWARD_DEFAULT``).
+        ``"exact"`` (the kernel sum at every query) or ``"tabulated"`` (cubic
+        Hermite interpolation of the exact CDF and kernel density on
+        ``n_forward_knots`` uniform knots per axis). ``None`` (the default)
+        reads ``general.yaml`` ``[inversion] rtu_forward`` (packaged default
+        ``"exact"``); see ``kernel_forward_from_config``.
     n_forward_knots
         Knots per axis of the forward table (``forward="tabulated"`` only).
+        ``None`` reads ``[inversion] rtu_forward_knots`` (packaged default 1024).
     xp
         The array library to use (numpy or jax.numpy).
     """
+    config_forward, config_knots = kernel_forward_from_config()
+    if forward is None:
+        forward = config_forward
+    if n_forward_knots is None:
+        n_forward_knots = config_knots
+
     if forward not in ("exact", "tabulated"):
         raise ValueError(
             f"forward must be 'exact' or 'tabulated', got {forward!r}."
@@ -496,8 +536,8 @@ def _transforms_from(
     n_knots: int,
     transform: str,
     xp,
-    forward: str = KERNEL_FORWARD_DEFAULT,
-    n_forward_knots: int = KERNEL_FORWARD_DEFAULT_KNOTS,
+    forward: Optional[str] = None,
+    n_forward_knots: Optional[int] = None,
 ):
     """
     Dispatch to the requested lattice-transform pair: the empirical rank CDF
@@ -530,8 +570,8 @@ def adaptive_rectangular_transformed_grid_from(
     bandwidth: float = KERNEL_CDF_DEFAULT_BANDWIDTH,
     n_knots: int = KERNEL_CDF_DEFAULT_KNOTS,
     transform: str = "kernel",
-    forward: str = KERNEL_FORWARD_DEFAULT,
-    n_forward_knots: int = KERNEL_FORWARD_DEFAULT_KNOTS,
+    forward: Optional[str] = None,
+    n_forward_knots: Optional[int] = None,
     xp=np,
 ):
     """Map unit-square coordinates back to the source plane via the adaptive CDF."""
@@ -564,8 +604,8 @@ def adaptive_rectangular_areas_from(
     bandwidth: float = KERNEL_CDF_DEFAULT_BANDWIDTH,
     n_knots: int = KERNEL_CDF_DEFAULT_KNOTS,
     transform: str = "kernel",
-    forward: str = KERNEL_FORWARD_DEFAULT,
-    n_forward_knots: int = KERNEL_FORWARD_DEFAULT_KNOTS,
+    forward: Optional[str] = None,
+    n_forward_knots: Optional[int] = None,
     xp=np,
 ):
     """The source-plane area of every mesh pixel under the adaptive CDF transform."""
@@ -608,8 +648,8 @@ def adaptive_rectangular_mappings_weights_via_interpolation_from(
     bandwidth: float = KERNEL_CDF_DEFAULT_BANDWIDTH,
     n_knots: int = KERNEL_CDF_DEFAULT_KNOTS,
     transform: str = "kernel",
-    forward: str = KERNEL_FORWARD_DEFAULT,
-    n_forward_knots: int = KERNEL_FORWARD_DEFAULT_KNOTS,
+    forward: Optional[str] = None,
+    n_forward_knots: Optional[int] = None,
     xp=np,
 ):
     """
@@ -667,10 +707,12 @@ def adaptive_rectangular_mappings_weights_via_interpolation_from(
         The lattice transform: ``"rank"`` (empirical rank CDF, the Bilinear
         meshes) or ``"kernel"`` (kernel-density CDF, the RTU meshes).
     forward
-        Kernel forward evaluation, ``"exact"`` or ``"tabulated"`` (see
-        ``create_transforms``; kernel transform only).
+        Kernel forward evaluation, ``"exact"`` or ``"tabulated"``; ``None``
+        reads the ``rtu_forward`` config (see ``create_transforms``; kernel
+        transform only).
     n_forward_knots
-        Knots per axis of the tabulated forward (kernel transform only).
+        Knots per axis of the tabulated forward; ``None`` reads the
+        ``rtu_forward_knots`` config (kernel transform only).
 
     Returns
     -------
@@ -787,8 +829,8 @@ class InterpolatorRectangular(AbstractInterpolator):
         bandwidth: float = KERNEL_CDF_DEFAULT_BANDWIDTH,
         n_knots: int = KERNEL_CDF_DEFAULT_KNOTS,
         transform: str = "kernel",
-        forward: str = KERNEL_FORWARD_DEFAULT,
-        n_forward_knots: int = KERNEL_FORWARD_DEFAULT_KNOTS,
+        forward: Optional[str] = None,
+        n_forward_knots: Optional[int] = None,
         xp=np,
     ):
         super().__init__(
