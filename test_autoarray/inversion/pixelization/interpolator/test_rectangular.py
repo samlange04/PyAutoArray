@@ -18,6 +18,7 @@ import autoarray as aa
 from autoarray.inversion.mesh.interpolator.rectangular import (
     KERNEL_CDF_DEFAULT_KNOTS,
     KERNEL_FORWARD_BLOCK,
+    KERNEL_FORWARD_DEFAULT,
     InterpolatorRectangular,
     adaptive_rectangular_areas_from,
     adaptive_rectangular_mappings_weights_via_interpolation_from,
@@ -594,6 +595,157 @@ def test__forward_transform__windowed_numba_matches_dense_reference(weighted):
     )
 
     np.testing.assert_allclose(fwd(q), reference, rtol=0.0, atol=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# Tabulated (cubic Hermite) kernel forward transform
+#
+# ``forward="tabulated"`` replaces the exact O(M_sub x N_data) kernel sum at
+# every query with Hermite interpolation of the exact CDF and kernel density
+# on a uniform knot table. These pin that it reproduces the exact forward to
+# interpolation accuracy, converges with the knot count at the cubic rate,
+# saturates identically outside the data box, is monotone, and that the
+# default stays ``"exact"`` (so nothing changes for existing users).
+# ---------------------------------------------------------------------------
+
+
+def test__create_transforms__forward_default_is_exact():
+    assert KERNEL_FORWARD_DEFAULT == "exact"
+    mesh = aa.mesh.RectangularRTUAdaptDensity(shape=(4, 4))
+    assert mesh.forward == "exact"
+
+
+def test__create_transforms__invalid_forward_raises():
+    data_grid, _, _ = _seeded_inputs()
+    with pytest.raises(ValueError, match="forward must be"):
+        create_transforms(data_grid, mesh_pixels=8, forward="linear", xp=np)
+
+
+@pytest.mark.parametrize("weighted", [False, True])
+def test__create_transforms__tabulated_forward_matches_exact(weighted):
+    data_grid, data_grid_over, weights = _seeded_inputs(M=400, K=3000, seed=3)
+    w = weights if weighted else None
+
+    q = np.concatenate(
+        [
+            data_grid_over,
+            data_grid.min(axis=0) - 1.0 + np.zeros((1, 2)),
+            data_grid.max(axis=0) + 1.0 + np.zeros((1, 2)),
+        ]
+    )
+
+    fwd_exact, inv_exact = create_transforms(
+        data_grid, mesh_pixels=16, mesh_weight_map=w, xp=np
+    )
+    fwd_tab, inv_tab = create_transforms(
+        data_grid,
+        mesh_pixels=16,
+        mesh_weight_map=w,
+        forward="tabulated",
+        n_forward_knots=2048,
+        xp=np,
+    )
+
+    # Interpolation accuracy far below a mesh pixel (1/13 of the unit square).
+    np.testing.assert_allclose(fwd_tab(q), fwd_exact(q), rtol=0.0, atol=1e-7)
+    # Saturated tails agree exactly, and the inverse table is untouched.
+    np.testing.assert_array_equal(fwd_tab(q[-2:]), fwd_exact(q[-2:]))
+    u = np.linspace(0.0, 1.0, 11)[:, None] * np.ones((1, 2))
+    np.testing.assert_array_equal(inv_tab(u), inv_exact(u))
+
+
+def test__create_transforms__tabulated_forward_converges_at_cubic_rate():
+    data_grid, data_grid_over, _ = _seeded_inputs(M=400, K=3000, seed=5)
+    fwd_exact, _ = create_transforms(data_grid, mesh_pixels=16, xp=np)
+    reference = fwd_exact(data_grid_over)
+
+    errors = []
+    for knots in (64, 128, 256):
+        fwd_tab, _ = create_transforms(
+            data_grid,
+            mesh_pixels=16,
+            forward="tabulated",
+            n_forward_knots=knots,
+            xp=np,
+        )
+        errors.append(np.max(np.abs(fwd_tab(data_grid_over) - reference)))
+
+    # Cubic Hermite with exact derivatives: error ~ dx^4, so doubling the
+    # knots should cut it by ~16; require at least 8 as a robust margin.
+    assert errors[1] < errors[0] / 8, errors
+    assert errors[2] < errors[1] / 8, errors
+
+
+def test__create_transforms__tabulated_forward_monotone_and_bounded():
+    data_grid, _, weights = _seeded_inputs(M=300, seed=9)
+    fwd_tab, _ = create_transforms(
+        data_grid,
+        mesh_pixels=16,
+        mesh_weight_map=weights,
+        forward="tabulated",
+        n_forward_knots=512,
+        xp=np,
+    )
+    xs = np.linspace(data_grid.min() - 0.5, data_grid.max() + 0.5, 5001)
+    for axis in range(2):
+        q = np.zeros((xs.size, 2))
+        q[:, axis] = xs
+        F = fwd_tab(q)[:, axis]
+        assert np.all(np.diff(F) >= 0.0)
+        assert F.min() == 0.0 and F.max() == 1.0
+
+
+def test__mappings_sizes_weights__tabulated_forward_matches_exact():
+    data_grid, data_grid_over, weights = _seeded_inputs(M=400, K=3000, seed=11)
+
+    exact = adaptive_rectangular_mappings_weights_via_interpolation_from(
+        source_grid_size=16,
+        data_grid=data_grid,
+        data_grid_over_sampled=data_grid_over,
+        mesh_weight_map=weights,
+        xp=np,
+    )
+    tab = adaptive_rectangular_mappings_weights_via_interpolation_from(
+        source_grid_size=16,
+        data_grid=data_grid,
+        data_grid_over_sampled=data_grid_over,
+        mesh_weight_map=weights,
+        forward="tabulated",
+        n_forward_knots=2048,
+        xp=np,
+    )
+
+    # Cell assignment can legitimately differ for a query within ~1e-7 of a
+    # cell edge; require the scattered flux to agree point by point instead.
+    def scatter(mappings, weights_):
+        out = np.zeros((mappings.shape[0], 16 * 16))
+        np.put_along_axis(out, mappings, weights_, axis=1)
+        return out
+
+    np.testing.assert_allclose(
+        scatter(*tab), scatter(*exact), rtol=0.0, atol=2e-6
+    )
+
+
+def test__InterpolatorRectangular__tabulated_forward_threads_to_geometry():
+    data_grid, _, _ = _seeded_inputs(M=200, K=800, seed=13)
+    mesh = aa.mesh.RectangularRTUAdaptDensity(
+        shape=(8, 8), forward="tabulated", n_forward_knots=1024
+    )
+    grid = aa.Grid2DIrregular(values=data_grid)
+    interpolator = mesh.interpolator_cls(
+        mesh=mesh,
+        mesh_grid=grid,
+        data_grid=grid,
+        mesh_weight_map=None,
+        **mesh.interpolator_kwargs,
+        xp=np,
+    )
+    geometry = interpolator.mesh_geometry
+    assert interpolator.forward == "tabulated"
+    assert interpolator.n_forward_knots == 1024
+    assert geometry.kernel_forward == "tabulated"
+    assert geometry.kernel_forward_knots == 1024
 
 
 # ---------------------------------------------------------------------------

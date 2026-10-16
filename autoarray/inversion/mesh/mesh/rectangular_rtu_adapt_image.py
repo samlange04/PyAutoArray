@@ -15,6 +15,8 @@ class RectangularRTUAdaptImage(RectangularRTUAdaptDensity):
         weight_floor: float = 0.0,
         bandwidth: Optional[float] = None,
         n_knots: Optional[int] = None,
+        forward: Optional[str] = None,
+        n_forward_knots: Optional[int] = None,
         respect_small_datasets: bool = True,
     ):
         """
@@ -81,12 +83,20 @@ class RectangularRTUAdaptImage(RectangularRTUAdaptDensity):
         n_knots : int, optional
             Size of the fixed knot table used to invert the CDF. Defaults to
             the kernel default.
+        forward : str, optional
+            Kernel forward evaluation, ``"exact"`` or ``"tabulated"`` (see
+            `RectangularRTUAdaptDensity`). Defaults to the kernel default.
+        n_forward_knots : int, optional
+            Knots per axis of the tabulated forward. Defaults to the kernel
+            default.
         """
 
         super().__init__(
             shape=shape,
             bandwidth=bandwidth,
             n_knots=n_knots,
+            forward=forward,
+            n_forward_knots=n_forward_knots,
             respect_small_datasets=respect_small_datasets,
         )
 
