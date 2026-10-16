@@ -133,6 +133,27 @@ KERNEL_CDF_DEFAULT_KNOTS: int = 64
 # only tile the query axis.
 KERNEL_FORWARD_BLOCK: int = 512
 
+# The forward transform of the kernel CDF: ``"exact"`` evaluates the kernel
+# sum at every query point (the reference, and the default); ``"tabulated"``
+# evaluates the exact CDF *and its derivative* (the kernel density) on a
+# fixed uniform table of ``n_forward_knots`` knots per axis and interpolates
+# every query with a cubic Hermite segment. The table costs
+# O(n_forward_knots x N_data) instead of O(M_sub x N_data), so at production
+# imaging scale (M_sub ~ 1e5 over-sampled queries) the per-call erf count
+# drops by M_sub / n_forward_knots. The Hermite segment keeps the transform C1
+# in the queries (the traced points, which move with the mass model) and the
+# knot values are exact kernel sums, so it stays C-infinity in the data
+# points. The default stays ``"exact"`` so no existing result or regression
+# pin changes; the tabulated forward is an opt-in for fp64-weak GPUs where
+# the exact O(M_sub x N_data) sum dominates the likelihood. 1024 knots per
+# axis interpolates the CDF to ~1e-10 of the unit square (16x better per
+# doubling); on an HST fit (N = 15.4k, M_sub = 63k, 30-pixel mesh, RTX A6000,
+# float64) the per-likelihood cost fell from 558 ms to 143-148 ms at 256-1024
+# knots, with the remainder being the rest of the likelihood, so more knots
+# only add table cost (219 ms at 8192).
+KERNEL_FORWARD_DEFAULT: str = "exact"
+KERNEL_FORWARD_DEFAULT_KNOTS: int = 1024
+
 _SQRT2 = np.sqrt(2.0)
 
 # Phi(t) saturates to exactly-representable 0/1 contributions in fp64 well
@@ -181,6 +202,42 @@ def _norm_cdf(t, xp):
         from jax.scipy.special import erf
 
     return 0.5 * (1.0 + erf(t / _SQRT2))
+
+
+_INV_SQRT_2PI = 1.0 / np.sqrt(2.0 * np.pi)
+
+
+def _norm_pdf(t, xp):
+    """Standard normal PDF, xp-aware."""
+    return _INV_SQRT_2PI * xp.exp(-0.5 * t * t)
+
+
+def _hermite_forward(lo, dx, F_knots, f_knots, q, xp):
+    """
+    Cubic Hermite interpolation of a per-axis table of CDF values
+    ``F_knots`` and derivatives ``f_knots`` on uniform knots
+    ``lo + k * dx`` (shapes ``(K, 2)``), evaluated at the ``(M, 2)`` queries
+    ``q``. Queries are clamped to the table range: outside the data bounding
+    box the exact transform saturates to 0 / 1 after rescaling, and so does
+    the clamped table (its end knots are the box edges).
+    """
+    K = F_knots.shape[0]
+    s = (q - lo[None, :]) / dx[None, :]
+    s = xp.clip(s, 0.0, K - 1.0)
+    k = xp.clip(xp.floor(s), 0, K - 2).astype("int64")
+    t = s - k
+    t2 = t * t
+    t3 = t2 * t
+    h00 = 2.0 * t3 - 3.0 * t2 + 1.0
+    h10 = t3 - 2.0 * t2 + t
+    h01 = -2.0 * t3 + 3.0 * t2
+    h11 = t3 - t2
+    ax = xp.arange(2)[None, :]
+    F0 = F_knots[k, ax]
+    F1 = F_knots[k + 1, ax]
+    m0 = f_knots[k, ax] * dx[None, :]
+    m1 = f_knots[k + 1, ax] * dx[None, :]
+    return h00 * F0 + h10 * m0 + h01 * F1 + h11 * m1
 
 
 def create_transforms_rank(traced_points, mesh_weight_map=None, xp=np):
@@ -267,6 +324,8 @@ def create_transforms(
     mesh_weight_map=None,
     bandwidth: float = KERNEL_CDF_DEFAULT_BANDWIDTH,
     n_knots: int = KERNEL_CDF_DEFAULT_KNOTS,
+    forward: str = KERNEL_FORWARD_DEFAULT,
+    n_forward_knots: int = KERNEL_FORWARD_DEFAULT_KNOTS,
     xp=np,
 ):
     """
@@ -293,9 +352,22 @@ def create_transforms(
         geometry towards uniform.
     n_knots
         Size of the fixed knot table used to invert the CDF.
+    forward
+        How the forward transform is evaluated at the query points:
+        ``"exact"`` (the kernel sum at every query, the default) or
+        ``"tabulated"`` (cubic Hermite interpolation of the exact CDF and
+        kernel density on ``n_forward_knots`` uniform knots per axis; see
+        ``KERNEL_FORWARD_DEFAULT``).
+    n_forward_knots
+        Knots per axis of the forward table (``forward="tabulated"`` only).
     xp
         The array library to use (numpy or jax.numpy).
     """
+    if forward not in ("exact", "tabulated"):
+        raise ValueError(
+            f"forward must be 'exact' or 'tabulated', got {forward!r}."
+        )
+
     points = traced_points
     N = points.shape[0]
 
@@ -312,6 +384,27 @@ def create_transforms(
     def F_raw_block(q_block):
         t = (q_block[:, None, :] - points[None, :, :]) / h[None, None, :]
         return xp.sum(w[None, :, None] * _norm_cdf(t, xp), axis=1)
+
+    def f_raw_block(q_block):
+        # The kernel density dF/dq: the exact derivative of F_raw_block.
+        t = (q_block[:, None, :] - points[None, :, :]) / h[None, None, :]
+        return xp.sum(w[None, :, None] * _norm_pdf(t, xp), axis=1) / h[None, :]
+
+    def f_raw(q):
+        # Blocked like the JAX F_raw; only ever called on the forward knot
+        # table (n_forward_knots queries), never on the over-sampled grid.
+        M = q.shape[0]
+        n_blocks = -(-M // KERNEL_FORWARD_BLOCK)
+        pad = n_blocks * KERNEL_FORWARD_BLOCK - M
+        q_padded = xp.pad(q, ((0, pad), (0, 0)))
+        blocks = q_padded.reshape(n_blocks, KERNEL_FORWARD_BLOCK, 2)
+        if xp.__name__.startswith("jax"):
+            import jax
+
+            out = jax.lax.map(f_raw_block, blocks)
+        else:
+            out = np.stack([f_raw_block(b) for b in blocks])
+        return out.reshape(n_blocks * KERNEL_FORWARD_BLOCK, 2)[:M]
 
     if xp.__name__.startswith("jax"):
 
@@ -366,9 +459,26 @@ def create_transforms(
 
     F_knots = (F_knots_raw - F_lo[None, :]) / denom[None, :]
 
-    def transform(q):
-        F_q = (F_raw(q) - F_lo[None, :]) / denom[None, :]
-        return xp.clip(F_q, 0.0, 1.0)
+    if forward == "exact":
+
+        def transform(q):
+            F_q = (F_raw(q) - F_lo[None, :]) / denom[None, :]
+            return xp.clip(F_q, 0.0, 1.0)
+
+    else:
+        # Tabulated forward: the exact CDF and kernel density on a uniform
+        # table over the data bounding box, Hermite-interpolated per query.
+        # Both tables are exact kernel sums (C-infinity in the data points);
+        # the Hermite segment is C1 in the query.
+        u_fwd = xp.linspace(0.0, 1.0, n_forward_knots)
+        knots_fwd = lo[None, :] + u_fwd[:, None] * span[None, :]
+        dx_fwd = span / (n_forward_knots - 1)
+        F_fwd = (F_raw(knots_fwd) - F_lo[None, :]) / denom[None, :]
+        f_fwd = f_raw(knots_fwd) / denom[None, :]
+
+        def transform(q):
+            F_q = _hermite_forward(lo, dx_fwd, F_fwd, f_fwd, q, xp)
+            return xp.clip(F_q, 0.0, 1.0)
 
     if xp.__name__.startswith("jax"):
         inv_transform = partial(reverse_interp, F_knots, knots)
@@ -386,6 +496,8 @@ def _transforms_from(
     n_knots: int,
     transform: str,
     xp,
+    forward: str = KERNEL_FORWARD_DEFAULT,
+    n_forward_knots: int = KERNEL_FORWARD_DEFAULT_KNOTS,
 ):
     """
     Dispatch to the requested lattice-transform pair: the empirical rank CDF
@@ -404,6 +516,8 @@ def _transforms_from(
         mesh_weight_map=mesh_weight_map,
         bandwidth=bandwidth,
         n_knots=n_knots,
+        forward=forward,
+        n_forward_knots=n_forward_knots,
         xp=xp,
     )
 
@@ -416,6 +530,8 @@ def adaptive_rectangular_transformed_grid_from(
     bandwidth: float = KERNEL_CDF_DEFAULT_BANDWIDTH,
     n_knots: int = KERNEL_CDF_DEFAULT_KNOTS,
     transform: str = "kernel",
+    forward: str = KERNEL_FORWARD_DEFAULT,
+    n_forward_knots: int = KERNEL_FORWARD_DEFAULT_KNOTS,
     xp=np,
 ):
     """Map unit-square coordinates back to the source plane via the adaptive CDF."""
@@ -430,6 +546,8 @@ def adaptive_rectangular_transformed_grid_from(
         bandwidth=bandwidth,
         n_knots=n_knots,
         transform=transform,
+        forward=forward,
+        n_forward_knots=n_forward_knots,
         xp=xp,
     )
 
@@ -446,6 +564,8 @@ def adaptive_rectangular_areas_from(
     bandwidth: float = KERNEL_CDF_DEFAULT_BANDWIDTH,
     n_knots: int = KERNEL_CDF_DEFAULT_KNOTS,
     transform: str = "kernel",
+    forward: str = KERNEL_FORWARD_DEFAULT,
+    n_forward_knots: int = KERNEL_FORWARD_DEFAULT_KNOTS,
     xp=np,
 ):
     """The source-plane area of every mesh pixel under the adaptive CDF transform."""
@@ -463,6 +583,8 @@ def adaptive_rectangular_areas_from(
         bandwidth=bandwidth,
         n_knots=n_knots,
         transform=transform,
+        forward=forward,
+        n_forward_knots=n_forward_knots,
         xp=xp,
     )
 
@@ -486,6 +608,8 @@ def adaptive_rectangular_mappings_weights_via_interpolation_from(
     bandwidth: float = KERNEL_CDF_DEFAULT_BANDWIDTH,
     n_knots: int = KERNEL_CDF_DEFAULT_KNOTS,
     transform: str = "kernel",
+    forward: str = KERNEL_FORWARD_DEFAULT,
+    n_forward_knots: int = KERNEL_FORWARD_DEFAULT_KNOTS,
     xp=np,
 ):
     """
@@ -542,6 +666,11 @@ def adaptive_rectangular_mappings_weights_via_interpolation_from(
     transform
         The lattice transform: ``"rank"`` (empirical rank CDF, the Bilinear
         meshes) or ``"kernel"`` (kernel-density CDF, the RTU meshes).
+    forward
+        Kernel forward evaluation, ``"exact"`` or ``"tabulated"`` (see
+        ``create_transforms``; kernel transform only).
+    n_forward_knots
+        Knots per axis of the tabulated forward (kernel transform only).
 
     Returns
     -------
@@ -565,6 +694,8 @@ def adaptive_rectangular_mappings_weights_via_interpolation_from(
         bandwidth=bandwidth,
         n_knots=n_knots,
         transform=transform,
+        forward=forward,
+        n_forward_knots=n_forward_knots,
         xp=xp,
     )
 
@@ -656,6 +787,8 @@ class InterpolatorRectangular(AbstractInterpolator):
         bandwidth: float = KERNEL_CDF_DEFAULT_BANDWIDTH,
         n_knots: int = KERNEL_CDF_DEFAULT_KNOTS,
         transform: str = "kernel",
+        forward: str = KERNEL_FORWARD_DEFAULT,
+        n_forward_knots: int = KERNEL_FORWARD_DEFAULT_KNOTS,
         xp=np,
     ):
         super().__init__(
@@ -669,6 +802,8 @@ class InterpolatorRectangular(AbstractInterpolator):
         self.bandwidth = bandwidth
         self.n_knots = n_knots
         self.transform = transform
+        self.forward = forward
+        self.n_forward_knots = n_forward_knots
 
     @cached_property
     def mesh_geometry(self):
@@ -684,6 +819,8 @@ class InterpolatorRectangular(AbstractInterpolator):
             kernel_bandwidth=self.bandwidth,
             kernel_knots=self.n_knots,
             transform=self.transform,
+            kernel_forward=self.forward,
+            kernel_forward_knots=self.n_forward_knots,
             xp=self._xp,
         )
 
@@ -698,6 +835,8 @@ class InterpolatorRectangular(AbstractInterpolator):
                 bandwidth=self.bandwidth,
                 n_knots=self.n_knots,
                 transform=self.transform,
+                forward=self.forward,
+                n_forward_knots=self.n_forward_knots,
                 xp=self._xp,
             )
         )

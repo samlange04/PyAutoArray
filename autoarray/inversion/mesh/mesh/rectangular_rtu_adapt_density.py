@@ -72,6 +72,8 @@ class RectangularRTUAdaptDensity(AbstractMesh):
         shape: Tuple[int, int] = (3, 3),
         bandwidth: Optional[float] = None,
         n_knots: Optional[int] = None,
+        forward: Optional[str] = None,
+        n_forward_knots: Optional[int] = None,
         respect_small_datasets: bool = True,
     ):
         """
@@ -134,6 +136,16 @@ class RectangularRTUAdaptDensity(AbstractMesh):
         n_knots
             Size of the fixed knot table used to invert the CDF. Defaults to
             the kernel default.
+        forward
+            How the kernel CDF is evaluated at the over-sampled traced points:
+            ``"exact"`` (the kernel sum at every point; the default, and the
+            reference) or ``"tabulated"`` (cubic Hermite interpolation of the
+            exact CDF and density on ``n_forward_knots`` knots per axis, which
+            cuts the per-likelihood erf count by M_sub / n_forward_knots on
+            fp64-weak GPUs). Defaults to the kernel default.
+        n_forward_knots
+            Knots per axis of the tabulated forward. Defaults to the kernel
+            default.
         respect_small_datasets
             When ``PYAUTO_SMALL_DATASETS=1`` is set, `shape` is capped per axis
             to the small-datasets cap, matching the cap `Grid2D.uniform` and
@@ -149,6 +161,8 @@ class RectangularRTUAdaptDensity(AbstractMesh):
         from autoarray.inversion.mesh.interpolator.rectangular import (
             KERNEL_CDF_DEFAULT_BANDWIDTH,
             KERNEL_CDF_DEFAULT_KNOTS,
+            KERNEL_FORWARD_DEFAULT,
+            KERNEL_FORWARD_DEFAULT_KNOTS,
         )
 
         shape = cap_mesh_shape_for_small_datasets(
@@ -166,6 +180,12 @@ class RectangularRTUAdaptDensity(AbstractMesh):
             bandwidth if bandwidth is not None else KERNEL_CDF_DEFAULT_BANDWIDTH
         )
         self.n_knots = int(n_knots if n_knots is not None else KERNEL_CDF_DEFAULT_KNOTS)
+        self.forward = str(forward if forward is not None else KERNEL_FORWARD_DEFAULT)
+        self.n_forward_knots = int(
+            n_forward_knots
+            if n_forward_knots is not None
+            else KERNEL_FORWARD_DEFAULT_KNOTS
+        )
         super().__init__()
 
     @property
@@ -210,7 +230,12 @@ class RectangularRTUAdaptDensity(AbstractMesh):
         meshes; overridden to `{}` by `RectangularUniform`, whose
         interpolator takes no kernel arguments.
         """
-        return {"bandwidth": self.bandwidth, "n_knots": self.n_knots}
+        return {
+            "bandwidth": self.bandwidth,
+            "n_knots": self.n_knots,
+            "forward": self.forward,
+            "n_forward_knots": self.n_forward_knots,
+        }
 
     def mesh_weight_map_from(self, adapt_data, xp=np) -> np.ndarray:
         """

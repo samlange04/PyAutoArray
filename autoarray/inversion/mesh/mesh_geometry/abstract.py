@@ -12,6 +12,8 @@ class AbstractMeshGeometry:
         kernel_bandwidth=None,
         kernel_knots=None,
         transform="kernel",
+        kernel_forward=None,
+        kernel_forward_knots=None,
         xp=np,
     ):
 
@@ -28,6 +30,10 @@ class AbstractMeshGeometry:
         # (the Bilinear meshes) — must match the mapper's transform so the
         # geometry is consistent with where the mapper scatters its flux.
         self.transform = transform
+        # Kernel forward evaluation ("exact" / "tabulated") and its table
+        # size; None falls back to the kernel defaults.
+        self.kernel_forward = kernel_forward
+        self.kernel_forward_knots = kernel_forward_knots
         self._use_jax = xp is not np
 
     @property
