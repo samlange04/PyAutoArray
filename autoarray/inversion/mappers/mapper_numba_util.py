@@ -113,6 +113,7 @@ def adaptive_pixel_signal_sums_from(
     slim_index_for_sub_slim_index: np.ndarray,
     adapt_data: np.ndarray,
     exclude_zero_weight_mappings: bool,
+    count_weights: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     The summed weighted adapt-data signal and the number of counted mapping entries in every pixelization pixel,
@@ -143,6 +144,9 @@ def adaptive_pixel_signal_sums_from(
         The adapt image whose values are summed.
     exclude_zero_weight_mappings
         Whether entries with a zero weight are skipped (Delaunay interpolators, PyAutoArray#627).
+    count_weights
+        Whether the counts sum the mapping weights instead of 1 per entry (`adaptive_pixel_signals_from`'s
+        `normalisation="weights"`).
 
     Returns
     -------
@@ -166,6 +170,6 @@ def adaptive_pixel_signal_sums_from(
                 continue
 
             pixel_signals[pix] += data_value * weight
-            pixel_counts[pix] += 1.0
+            pixel_counts[pix] += weight if count_weights else 1.0
 
     return pixel_signals, pixel_counts
