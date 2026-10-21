@@ -1,6 +1,30 @@
 from functools import partial
 import numpy as np
-from typing import Tuple
+from typing import Optional, Tuple
+
+PIXEL_SIGNAL_NORMALISATION_DEFAULT: str = "count"
+
+
+def pixel_signal_normalisation_from_config() -> str:
+    """
+    How `adaptive_pixel_signals_from` normalises each pixel's signal, from ``general.yaml``
+    ``[inversion] pixel_signal_normalisation``: ``"count"`` (the packaged default) divides by
+    the number of mapping entries in the pixel, ``"weights"`` by the sum of their mapping
+    weights. A workspace ``general.yaml`` that omits the key falls through to the packaged
+    value; the fallback here fires only when a workspace config is the sole config path.
+    """
+    from autonerves import conf
+
+    try:
+        value = conf.instance["general"]["inversion"]["pixel_signal_normalisation"]
+    except KeyError:
+        value = PIXEL_SIGNAL_NORMALISATION_DEFAULT
+    value = str(value)
+    if value not in ("count", "weights"):
+        raise ValueError(
+            f"general.yaml [inversion] pixel_signal_normalisation must be 'count' or 'weights', not {value!r}"
+        )
+    return value
 
 
 def adaptive_pixel_signals_from(
@@ -12,6 +36,7 @@ def adaptive_pixel_signals_from(
     slim_index_for_sub_slim_index: np.ndarray,
     adapt_data: np.ndarray,
     exclude_zero_weight_mappings: bool = False,
+    normalisation: Optional[str] = None,
     xp=np,
 ) -> np.ndarray:
     """
@@ -25,6 +50,18 @@ def adaptive_pixel_signals_from(
        By default every mapping entry within a data point's size counts, including entries whose
        weight is zero. With `exclude_zero_weight_mappings=True` (set by Delaunay interpolators),
        zero-weight entries are not counted -- see that parameter.
+
+       With `normalisation="weights"` the divisor is instead the sum of the mapping weights
+       landing in the pixel. The integer count changes by whole units whenever a traced
+       (sub-)pixel crosses a mesh-pixel boundary, so a signal normalised by it -- and every
+       adaptive regularization built on it -- jumps discontinuously as the lens model moves,
+       even though the weighted signal sum itself is continuous (bilinear and barycentric
+       weights go to zero at a boundary). On a high signal-to-noise compact source the jumps
+       reach tens of nats on sub-sigma steps and stall nested sampling in its exploration
+       phase; dividing by the weight sum removes them (the weight sum is the continuous
+       version of the count: equal to it when every weight is 1). `None` reads the
+       ``general.yaml`` ``[inversion] pixel_signal_normalisation`` setting
+       (`pixel_signal_normalisation_from_config`), packaged default ``"count"``.
 
     2) Divided by the maximum pixel-signal, so that all signals vary between 0 and 1. This ensures that the
        regularization weight_list are defined identically for any data quantity or signal-to-noise_map ratio.
@@ -43,6 +80,9 @@ def adaptive_pixel_signals_from(
         A 1D array util every pixel on the grid to a pixel on the pixelization.
     adapt_data
         The image of the galaxy which is used to compute the weigghted pixel signals.
+    normalisation
+        ``"count"`` divides each pixel's weighted signal sum by its number of mapping entries, ``"weights"`` by
+        the sum of their weights (continuous in the traced positions, see step 1); ``None`` reads the config.
     exclude_zero_weight_mappings
         If `True`, mapping entries whose weight is exactly zero are not counted towards a pixel's number of
         mapped data points. Delaunay interpolators set this (via their `exclude_zero_weight_mappings` class
@@ -59,6 +99,15 @@ def adaptive_pixel_signals_from(
         and make the count (and hence the likelihood) jump wherever a clipped weight reaches zero.
     """
 
+    if normalisation is None:
+        normalisation = pixel_signal_normalisation_from_config()
+    elif normalisation not in ("count", "weights"):
+        raise ValueError(
+            f"normalisation must be 'count' or 'weights', not {normalisation!r}"
+        )
+
+    count_weights = normalisation == "weights"
+
     if xp.__name__.startswith("jax"):
         pixel_signals, pixel_counts = _pixel_signal_sums_jax(
             pixels=pixels,
@@ -68,6 +117,7 @@ def adaptive_pixel_signals_from(
             slim_index_for_sub_slim_index=slim_index_for_sub_slim_index,
             adapt_data=adapt_data,
             exclude_zero_weight_mappings=exclude_zero_weight_mappings,
+            count_weights=count_weights,
             xp=xp,
         )
     elif _use_numba():
@@ -83,6 +133,7 @@ def adaptive_pixel_signals_from(
             slim_index_for_sub_slim_index=np.asarray(slim_index_for_sub_slim_index),
             adapt_data=np.asarray(adapt_data),
             exclude_zero_weight_mappings=bool(exclude_zero_weight_mappings),
+            count_weights=count_weights,
         )
     else:
         pixel_signals, pixel_counts = _pixel_signal_sums_numpy(
@@ -93,6 +144,7 @@ def adaptive_pixel_signals_from(
             slim_index_for_sub_slim_index=slim_index_for_sub_slim_index,
             adapt_data=adapt_data,
             exclude_zero_weight_mappings=exclude_zero_weight_mappings,
+            count_weights=count_weights,
         )
 
     # 7) Normalize
@@ -166,12 +218,14 @@ def _pixel_signal_sums_jax(
     slim_index_for_sub_slim_index,
     adapt_data,
     exclude_zero_weight_mappings,
+    count_weights,
     xp,
 ):
     """
     The JAX branch of `adaptive_pixel_signals_from` steps 1-6: the summed weighted adapt-data signal and the
-    number of counted mapping entries in every pixel, built with fixed shapes over the full padded tables so it
-    traces under `jit` and stays differentiable.
+    number of counted mapping entries in every pixel (or, with `count_weights`, the sum of their mapping weights,
+    see `adaptive_pixel_signals_from`'s `normalisation`), built with fixed shapes over the full padded tables so
+    it traces under `jit` and stays differentiable.
     """
     M_sub, B = pix_indexes_for_sub_slim_index.shape
 
@@ -203,9 +257,10 @@ def _pixel_signal_sums_jax(
     pixel_signals = xp.zeros((pixels + 1,))
     pixel_counts = xp.zeros((pixels + 1,))
 
-    # 5) Scatter-add into signal sums and counts:
+    # 5) Scatter-add into signal sums and counts (or weight sums, see `count_weights`):
+    flat_count = flat_weights if count_weights else valid.astype(float)
     pixel_signals = pixel_signals.at[flat_pixidx].add(flat_contrib)
-    pixel_counts = pixel_counts.at[flat_pixidx].add(valid.astype(float))
+    pixel_counts = pixel_counts.at[flat_pixidx].add(flat_count)
 
     # 6) Drop the extra "out-of-bounds" slot:
     return pixel_signals[:pixels], pixel_counts[:pixels]
@@ -219,6 +274,7 @@ def _pixel_signal_sums_numpy(
     slim_index_for_sub_slim_index,
     adapt_data,
     exclude_zero_weight_mappings,
+    count_weights,
 ):
     """
     The NumPy branch of `adaptive_pixel_signals_from` steps 1-6, computed over the live mapping entries only.
@@ -232,6 +288,9 @@ def _pixel_signal_sums_numpy(
     in the same row-major order that `np.add.at` visited them, starting from the same `0.0`, and every entry it
     drops (padding, `-1` indexes, and zero weights when `exclude_zero_weight_mappings`) only ever reached the
     padded scatter's discarded out-of-bounds slot. Counts are integers, so summing them as integers is exact.
+
+    With `count_weights` the counts are the sums of the live mapping weights instead (see
+    `adaptive_pixel_signals_from`'s `normalisation`), summed in the same order as the padded scatter.
     """
     pix_indexes = np.asarray(pix_indexes_for_sub_slim_index)
     weights = np.asarray(pixel_weights).reshape(pix_indexes.shape)
@@ -262,7 +321,14 @@ def _pixel_signal_sums_numpy(
     pixel_signals = np.bincount(
         live_indexes, weights=data_values * live_weights, minlength=pixels
     )[:pixels]
-    pixel_counts = np.bincount(live_indexes, minlength=pixels)[:pixels].astype(float)
+    if count_weights:
+        pixel_counts = np.bincount(
+            live_indexes, weights=live_weights, minlength=pixels
+        )[:pixels]
+    else:
+        pixel_counts = np.bincount(live_indexes, minlength=pixels)[:pixels].astype(
+            float
+        )
 
     return pixel_signals, pixel_counts
 

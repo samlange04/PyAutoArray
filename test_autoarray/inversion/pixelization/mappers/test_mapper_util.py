@@ -1056,3 +1056,59 @@ def test__sparse_triplets_from__pix_sizes_for_sub_zeroes_invalid_entries__jax():
     )
 
     _assert_invalid_slots_zeroed(rows, cols, vals)
+
+
+@pytest.mark.parametrize("backend", ["numba", "numpy", "jax"])
+def test__adaptive_pixel_signals_from__weights_normalisation(backend, monkeypatch):
+    from autoarray.inversion.mappers import mapper_util
+
+    if backend == "jax":
+        xp = pytest.importorskip("jax.numpy")
+    else:
+        xp = np
+        monkeypatch.setattr(mapper_util, "_use_numba", lambda: backend == "numba")
+
+    # Two sub-pixels map to pixel 0 with fractional weights, one to pixel 1 with weight 1.
+    pix_indexes_for_sub_slim_index = np.array([[0], [0], [1]])
+    pixel_weights = np.array([[0.25], [0.75], [1.0]])
+    pixel_sizes = np.ones(3, dtype="int")
+    slim_index_for_sub_slim_index = np.array([0, 1, 2])
+    galaxy_image = np.array([1.0, 1.0, 1.0])
+
+    kwargs = dict(
+        pixels=2,
+        signal_scale=1.0,
+        pix_indexes_for_sub_slim_index=pix_indexes_for_sub_slim_index,
+        pix_size_for_sub_slim_index=pixel_sizes,
+        pixel_weights=pixel_weights,
+        slim_index_for_sub_slim_index=slim_index_for_sub_slim_index,
+        adapt_data=galaxy_image,
+        xp=xp,
+    )
+
+    # count: pixel 0 holds (0.25 + 0.75) / 2 entries = 0.5, pixel 1 holds 1 / 1; normalised by the max.
+    count = aa.util.mapper.adaptive_pixel_signals_from(normalisation="count", **kwargs)
+    assert count == pytest.approx(np.array([0.5, 1.0]))
+
+    # weights: pixel 0 holds (0.25 + 0.75) / (0.25 + 0.75) = 1, pixel 1 holds 1 / 1.
+    weights = aa.util.mapper.adaptive_pixel_signals_from(
+        normalisation="weights", **kwargs
+    )
+    assert weights == pytest.approx(np.array([1.0, 1.0]))
+
+    # With unit weights the two normalisations coincide.
+    kwargs["pixel_weights"] = np.ones((3, 1))
+    assert aa.util.mapper.adaptive_pixel_signals_from(
+        normalisation="weights", **kwargs
+    ) == pytest.approx(
+        aa.util.mapper.adaptive_pixel_signals_from(normalisation="count", **kwargs)
+    )
+
+    # The packaged config default is "count", so the default call matches it.
+    assert aa.util.mapper.pixel_signal_normalisation_from_config() == "count"
+    assert aa.util.mapper.adaptive_pixel_signals_from(**kwargs) == pytest.approx(
+        aa.util.mapper.adaptive_pixel_signals_from(normalisation="count", **kwargs)
+    )
+
+    with pytest.raises(ValueError):
+        aa.util.mapper.adaptive_pixel_signals_from(normalisation="median", **kwargs)
