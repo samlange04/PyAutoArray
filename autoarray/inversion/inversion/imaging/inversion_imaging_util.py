@@ -199,6 +199,14 @@ def data_linear_func_matrix_from(
 # the chunk size changes the launch count, not the arithmetic.
 SPARSE_TRANSPOSE_DOT_CHUNK = 16384
 
+# Columns of the noise-weighted blurred mapping matrix sent through the transposed FFT blur per
+# block in `curvature_matrix_via_sparse_transpose_from`. The blur holds a complex FFT cube of
+# (fft_shape x columns) per batch element -- complex128 for the default fp64 transposed blur,
+# where blurring all 970 columns of an HST-sized inversion at once cost ~1 GB per element and
+# put a batch of 20 out of memory on a 48 GB card (2026-10-26) -- so the columns go through in
+# blocks of this size, which bounds the cube whatever the mesh size. The arithmetic is unchanged.
+SPARSE_TRANSPOSE_BLUR_COLUMNS = 128
+
 
 def sparse_mapping_transpose_dot_from(
     rows,
@@ -321,6 +329,11 @@ def curvature_matrix_via_sparse_transpose_from(
     With several mappers each mapper's rows cover every column, so the mapper-mapper cross blocks
     come out of the same contraction.
 
+    **Memory.** The transposed blur goes through the columns in blocks of
+    `SPARSE_TRANSPOSE_BLUR_COLUMNS`, so its FFT cube (complex128 by default, twice the forward blur's
+    complex64) is bounded per batch element whatever the mesh size; all columns at once cost ~1 GB per
+    element for an HST lens at a 30 x 30 mesh and put a batch of 20 out of memory on a 48 GB card.
+
     **Cost.** The dense product is ``N_pix * S_tot**2`` multiply-adds (for an HST lens at 24.5k image
     pixels and a 30 x 30 mesh plus 70 linear-light columns, 0.09 s of a 0.19 s likelihood call on an
     A6000, and it grows with the square of the mesh size). This route costs one extra FFT blur of
@@ -372,14 +385,24 @@ def curvature_matrix_via_sparse_transpose_from(
     noise_map = xp.asarray(noise_map, dtype=xp.float64)
     s_tot = B.shape[1]
 
-    # P^T Sigma^-1 B : one transposed blur of every column.
-    Z = psf.transposed.convolved_mapping_matrix_from(
-        mapping_matrix=B / noise_map[:, None] ** 2,
-        mask=mask,
-        use_mixed_precision=settings.sparse_curvature_mixed_precision,
-        xp=xp,
+    # P^T Sigma^-1 B : one transposed blur of every column, in column blocks so the FFT cube
+    # stays bounded (see `SPARSE_TRANSPOSE_BLUR_COLUMNS`).
+    Y = B / noise_map[:, None] ** 2
+    transposed = psf.transposed
+    Z = xp.hstack(
+        [
+            xp.asarray(
+                transposed.convolved_mapping_matrix_from(
+                    mapping_matrix=Y[:, start : start + SPARSE_TRANSPOSE_BLUR_COLUMNS],
+                    mask=mask,
+                    use_mixed_precision=settings.sparse_curvature_mixed_precision,
+                    xp=xp,
+                ),
+                dtype=xp.float64,
+            )
+            for start in range(0, s_tot, SPARSE_TRANSPOSE_BLUR_COLUMNS)
+        ]
     )
-    Z = xp.asarray(Z, dtype=xp.float64)
 
     if xp is np:
         F = np.zeros((s_tot, s_tot), dtype=np.float64)
