@@ -1017,3 +1017,117 @@ def test__curvature_matrix_via_sparse_operator_from__dispatches_on_the_two_stage
             **kwargs
         ),
     )
+
+
+# ----------------------------------------------------------------------------
+# Sparse transposed-blur curvature route (`Settings.use_sparse_curvature`).
+# ----------------------------------------------------------------------------
+
+import importlib.util
+
+requires_jax = pytest.mark.skipif(
+    importlib.util.find_spec("jax") is None,
+    reason="requires jax (installed via the [optional] extras; absent on the NumPy-only matrix env)",
+)
+
+
+def _random_triplets(nnz, n_rows, n_cols, seed=0):
+    rng = np.random.default_rng(seed)
+    rows = rng.integers(0, n_rows, size=nnz)
+    cols = rng.integers(0, n_cols, size=nnz)
+    vals = rng.normal(size=nnz)
+    # A few masked stencil slots: zero value, column 0, as `sparse_triplets_from` emits them.
+    vals[::7] = 0.0
+    cols[::7] = 0
+    return rows, cols, vals
+
+
+def _dense_from_triplets(rows, cols, vals, n_rows, n_cols):
+    A = np.zeros((n_rows, n_cols))
+    np.add.at(A, (rows, cols), vals)
+    return A
+
+
+def test__sparse_mapping_transpose_dot_from__numpy_matches_dense_product():
+    n_rows, n_cols, k = 40, 11, 6
+    rows, cols, vals = _random_triplets(nnz=150, n_rows=n_rows, n_cols=n_cols)
+    dense = np.random.default_rng(1).normal(size=(n_rows, k))
+
+    A = _dense_from_triplets(rows, cols, vals, n_rows, n_cols)
+
+    out = aa.util.inversion_imaging.sparse_mapping_transpose_dot_from(
+        rows=rows, cols=cols, vals=vals, dense=dense, n_cols=n_cols
+    )
+
+    assert out.shape == (n_cols, k)
+    assert out == pytest.approx(A.T @ dense, rel=1.0e-12, abs=1.0e-12)
+
+
+@requires_jax
+def test__sparse_mapping_transpose_dot_from__jax_single_and_chunked_match_dense_product():
+    import jax
+
+    jax.config.update("jax_enable_x64", True)
+    import jax.numpy as jnp
+
+    n_rows, n_cols, k = 40, 11, 6
+    # nnz is not a multiple of the chunk, so the chunked loop pads its last step.
+    rows, cols, vals = _random_triplets(nnz=151, n_rows=n_rows, n_cols=n_cols)
+    dense = np.random.default_rng(1).normal(size=(n_rows, k))
+
+    expected = _dense_from_triplets(rows, cols, vals, n_rows, n_cols).T @ dense
+
+    args = dict(
+        rows=jnp.asarray(rows),
+        cols=jnp.asarray(cols),
+        vals=jnp.asarray(vals),
+        dense=jnp.asarray(dense),
+        n_cols=n_cols,
+        xp=jnp,
+    )
+
+    single = aa.util.inversion_imaging.sparse_mapping_transpose_dot_from(**args)
+    chunked = aa.util.inversion_imaging.sparse_mapping_transpose_dot_from(
+        **args, chunk=32
+    )
+    exact_multiple = aa.util.inversion_imaging.sparse_mapping_transpose_dot_from(
+        rows=jnp.asarray(rows[:150]),
+        cols=jnp.asarray(cols[:150]),
+        vals=jnp.asarray(vals[:150]),
+        dense=jnp.asarray(dense),
+        n_cols=n_cols,
+        xp=jnp,
+        chunk=50,
+    )
+
+    assert single.dtype == jnp.float64
+    assert np.asarray(single) == pytest.approx(expected, rel=1.0e-12, abs=1.0e-12)
+    assert np.asarray(chunked) == pytest.approx(expected, rel=1.0e-12, abs=1.0e-12)
+    assert np.asarray(exact_multiple) == pytest.approx(
+        _dense_from_triplets(rows[:150], cols[:150], vals[:150], n_rows, n_cols).T
+        @ dense,
+        rel=1.0e-12,
+        abs=1.0e-12,
+    )
+
+    # The chunked loop must be jit- and vmap-safe (static shapes; this is the production
+    # batched-likelihood path).
+    def f(dense_b):
+        return aa.util.inversion_imaging.sparse_mapping_transpose_dot_from(
+            rows=jnp.asarray(rows),
+            cols=jnp.asarray(cols),
+            vals=jnp.asarray(vals),
+            dense=dense_b,
+            n_cols=n_cols,
+            xp=jnp,
+            chunk=32,
+        )
+
+    batched = jax.jit(jax.vmap(f))(
+        jnp.stack([jnp.asarray(dense), 2.0 * jnp.asarray(dense)])
+    )
+
+    assert np.asarray(batched[0]) == pytest.approx(expected, rel=1.0e-12, abs=1.0e-12)
+    assert np.asarray(batched[1]) == pytest.approx(
+        2.0 * expected, rel=1.0e-12, abs=1.0e-12
+    )
