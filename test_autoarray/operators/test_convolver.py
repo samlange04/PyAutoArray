@@ -811,3 +811,44 @@ def test__convolved_mapping_matrix_from__mixed_precision__jax_fft_matches_numpy_
 
     assert blurred.dtype == jnp.float64
     assert np.asarray(blurred) == pytest.approx(reference, abs=1.0e-5)
+
+
+@pytest.mark.parametrize("kernel_shape", [(3, 3), (4, 4), (3, 5), (5, 4), (2, 2)])
+def test__transposed__is_exact_adjoint_of_mapping_matrix_convolution(kernel_shape):
+    """
+    `Convolver.transposed` convolves with the exact transpose of this convolver's masked
+    convolution: applying both to the identity gives ``P`` and ``P^T``, for odd and even
+    kernels (where the plain flip is off by one pixel) on an off-centre mask.
+    """
+    mask = np.full((9, 11), True)
+    mask[1:5, 2:7] = False
+    mask[4, 6] = True
+    mask = aa.Mask2D(mask=mask, pixel_scales=(1.0, 1.0))
+
+    rng = np.random.default_rng(3)
+    kernel = aa.Array2D.no_mask(
+        values=rng.uniform(0.1, 1.0, size=kernel_shape), pixel_scales=(1.0, 1.0)
+    )
+    convolver = aa.Convolver(kernel=kernel, use_fft=True)
+
+    n = int(np.sum(~mask))
+    identity = np.eye(n)
+
+    forward = convolver.convolved_mapping_matrix_from(
+        mapping_matrix=identity, mask=mask
+    )
+    transposed = convolver.transposed.convolved_mapping_matrix_from(
+        mapping_matrix=identity, mask=mask
+    )
+
+    ky, kx = kernel_shape
+    assert convolver.transposed.kernel.shape_native == (
+        ky + (1 - ky % 2),
+        kx + (1 - kx % 2),
+    )
+    assert np.asarray(transposed) == pytest.approx(np.asarray(forward).T, abs=1.0e-12)
+
+    if kernel_shape[0] % 2 == 1 and kernel_shape[1] % 2 == 1:
+        assert np.asarray(
+            convolver.reversed_kernel.kernel.native.array
+        ) == pytest.approx(np.asarray(convolver.transposed.kernel.native.array))

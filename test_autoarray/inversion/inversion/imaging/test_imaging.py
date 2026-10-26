@@ -563,3 +563,306 @@ def test__sparse_helpers__import_and_run_with_jax_blocked():
     subprocess.run(
         [sys.executable, "-c", script], check=True, env=environment, timeout=600
     )
+
+# ----------------------------------------------------------------------------
+# Sparse transposed-blur curvature route (`Settings.use_sparse_curvature`):
+# `InversionImagingMapping` must return the same `F` as the dense product.
+# ----------------------------------------------------------------------------
+
+from autoarray.inversion.inversion.imaging.mapping import InversionImagingMapping
+
+requires_jax = pytest.mark.skipif(
+    importlib.util.find_spec("jax") is None,
+    reason="requires jax (installed via the [optional] extras; absent on the NumPy-only matrix env)",
+)
+
+
+def _func_list_from(mask):
+    grid = aa.Grid2D.from_mask(mask=mask)
+    mapping_matrix = np.full(fill_value=0.5, shape=(grid.shape[0], 2))
+    mapping_matrix[0, 0] = 0.8
+    mapping_matrix[1, 1] = 0.4
+    return aa.m.MockLinearObjFuncList(
+        parameters=2, grid=grid, mapping_matrix=mapping_matrix
+    )
+
+
+def _off_centre_imaging_and_mapper(kernel_shape):
+    """
+    A mask whose bounding box sits off the stamp centre, under an even- or odd-shaped
+    asymmetric kernel, so the roll / slice conventions of the transposed FFT blur are
+    exercised rather than cancelling by symmetry. The mapper is a 3x3 rectangular mesh
+    over the sub-size-2 grid of that mask.
+    """
+    from autoarray.inversion.mesh.mesh.rectangular_rtu_adapt_density import (
+        overlay_grid_from,
+    )
+
+    mask = np.full((9, 11), True)
+    mask[1:5, 2:7] = False
+    mask[4, 6] = True
+    mask = aa.Mask2D(mask=mask, pixel_scales=(1.0, 1.0))
+
+    rng = np.random.default_rng(3)
+    kernel = aa.Array2D.no_mask(
+        values=rng.uniform(0.1, 1.0, size=kernel_shape), pixel_scales=(1.0, 1.0)
+    )
+    # Even kernels are FFT-only, and the FFT path is the production one anyway.
+    psf = aa.Convolver(kernel=kernel, use_fft=True)
+
+    imaging = aa.Imaging(
+        data=aa.Array2D(values=rng.normal(size=mask.shape), mask=mask),
+        noise_map=aa.Array2D(values=rng.uniform(1.0, 3.0, size=mask.shape), mask=mask),
+        psf=psf,
+        over_sample_size_lp=1,
+    ).apply_mask(mask=mask)
+
+    grid = aa.Grid2D.from_mask(mask=mask, over_sample_size=2)
+    shape_native = (3, 3)
+    source_plane_mesh_grid = overlay_grid_from(
+        shape_native=shape_native, grid=grid.over_sampled
+    )
+    mesh = aa.mesh.RectangularUniform(shape=shape_native)
+    interpolator = mesh.interpolator_from(
+        source_plane_data_grid=grid,
+        source_plane_mesh_grid=aa.Grid2DIrregular(source_plane_mesh_grid),
+        adapt_data=aa.Array2D.ones(shape_native, pixel_scales=0.1),
+    )
+    mapper = aa.Mapper(
+        interpolator=interpolator, regularization=aa.reg.Constant(coefficient=1.0)
+    )
+    return imaging, mapper
+
+
+def _assert_sparse_matches_dense(dense, sparse, rel=1.0e-10):
+    assert isinstance(sparse, InversionImagingMapping)
+    assert sparse._use_sparse_curvature
+    assert not dense._use_sparse_curvature
+
+    F_dense = np.asarray(dense.curvature_matrix)
+    F_sparse = np.asarray(sparse.curvature_matrix)
+
+    assert F_sparse.dtype == np.float64
+    assert F_sparse == pytest.approx(F_dense, rel=rel, abs=rel * np.abs(F_dense).max())
+    assert np.asarray(sparse.curvature_reg_matrix) == pytest.approx(
+        np.asarray(dense.curvature_reg_matrix), rel=rel, abs=rel * np.abs(F_dense).max()
+    )
+    assert np.asarray(sparse.reconstruction) == pytest.approx(
+        np.asarray(dense.reconstruction), rel=1.0e-6, abs=1.0e-8
+    )
+    assert float(sparse.log_det_curvature_reg_matrix_term) == pytest.approx(
+        float(dense.log_det_curvature_reg_matrix_term), rel=1.0e-8
+    )
+
+
+@pytest.mark.parametrize("positive_only", [False, True])
+def test__sparse_curvature__numpy__mapper_and_func_list_match_dense(
+    masked_imaging_7x7, rectangular_mapper_7x7_3x3, positive_only
+):
+    func = _func_list_from(masked_imaging_7x7.mask)
+
+    for linear_obj_list in (
+        [rectangular_mapper_7x7_3x3],
+        [func, rectangular_mapper_7x7_3x3],
+        [rectangular_mapper_7x7_3x3, func],
+    ):
+        dense = aa.Inversion(
+            dataset=masked_imaging_7x7,
+            linear_obj_list=linear_obj_list,
+            settings=aa.Settings(use_positive_only_solver=positive_only),
+        )
+        # On NumPy the route is taken only when asked for explicitly (it is the reference
+        # implementation there, not a speed-up).
+        sparse = aa.Inversion(
+            dataset=masked_imaging_7x7,
+            linear_obj_list=linear_obj_list,
+            settings=aa.Settings(
+                use_positive_only_solver=positive_only, use_sparse_curvature=True
+            ),
+        )
+        _assert_sparse_matches_dense(dense=dense, sparse=sparse)
+
+
+def test__sparse_curvature__no_mapper_falls_back_to_dense(masked_imaging_7x7):
+    func = _func_list_from(masked_imaging_7x7.mask)
+
+    inversion = aa.Inversion(
+        dataset=masked_imaging_7x7,
+        linear_obj_list=[func],
+        settings=aa.Settings(use_sparse_curvature=True),
+    )
+
+    assert not inversion._use_sparse_curvature
+    assert np.asarray(inversion.curvature_matrix).shape == (2, 2)
+
+
+@pytest.mark.parametrize("kernel_shape", [(3, 3), (4, 4), (3, 5), (5, 4)])
+def test__sparse_curvature__numpy__off_centre_mask_even_and_odd_kernels(kernel_shape):
+    imaging, mapper = _off_centre_imaging_and_mapper(kernel_shape=kernel_shape)
+    func = _func_list_from(imaging.mask)
+
+    dense = aa.Inversion(
+        dataset=imaging,
+        linear_obj_list=[func, mapper],
+        settings=aa.Settings(use_positive_only_solver=False),
+    )
+    sparse = aa.Inversion(
+        dataset=imaging,
+        linear_obj_list=[func, mapper],
+        settings=aa.Settings(use_positive_only_solver=False, use_sparse_curvature=True),
+    )
+    _assert_sparse_matches_dense(dense=dense, sparse=sparse)
+
+
+@requires_jax
+@pytest.mark.parametrize("kernel_shape", [(3, 3), (4, 4), (3, 5), (5, 4)])
+def test__sparse_curvature__jax_fp64__matches_dense_exactly(kernel_shape):
+    """
+    JAX FFT blurs in fp64 end to end (`use_mixed_precision=False`): the sparse route is the
+    dense product to round-off, under even and odd kernels on an off-centre mask.
+    """
+    import jax
+
+    jax.config.update("jax_enable_x64", True)
+    import jax.numpy as jnp
+
+    imaging, mapper = _off_centre_imaging_and_mapper(kernel_shape=kernel_shape)
+    func = _func_list_from(imaging.mask)
+    mapper_jax = type(mapper)(
+        interpolator=mapper.interpolator,
+        regularization=mapper.regularization,
+        image_plane_mesh_grid=mapper.image_plane_mesh_grid,
+        xp=jnp,
+    )
+
+    dense = aa.Inversion(
+        dataset=imaging,
+        linear_obj_list=[func, mapper_jax],
+        settings=aa.Settings(use_positive_only_solver=False),
+        xp=jnp,
+    )
+    sparse = aa.Inversion(
+        dataset=imaging,
+        linear_obj_list=[func, mapper_jax],
+        settings=aa.Settings(use_positive_only_solver=False, use_sparse_curvature=True),
+        xp=jnp,
+    )
+    _assert_sparse_matches_dense(dense=dense, sparse=sparse)
+
+    # The fp64 NumPy dense product is the same matrix again.
+    dense_np = aa.Inversion(
+        dataset=imaging,
+        linear_obj_list=[func, mapper],
+        settings=aa.Settings(use_positive_only_solver=False),
+    )
+    F_np = np.asarray(dense_np.curvature_matrix)
+    assert np.asarray(sparse.curvature_matrix) == pytest.approx(
+        F_np, rel=1.0e-10, abs=1.0e-10 * np.abs(F_np).max()
+    )
+
+
+@requires_jax
+@pytest.mark.parametrize("kernel_shape", [(3, 3), (4, 4)])
+@pytest.mark.parametrize("transposed_mixed", [False, True])
+def test__sparse_curvature__jax_mixed_precision__within_fp32_of_dense(
+    kernel_shape, transposed_mixed
+):
+    """
+    The production configuration: `use_mixed_precision=True` gives the forward blur an fp32
+    cube and complex64 forward FFT, so `B` itself carries ~1e-7 relative error and the two
+    routes can only agree to that level (the dense product squares `B`, the sparse route uses
+    it once). With `sparse_curvature_mixed_precision` the transposed blur takes the same fp32
+    path; the test pins that it runs and stays at the fp32 level, not that it is exact.
+    """
+    import jax
+
+    jax.config.update("jax_enable_x64", True)
+    import jax.numpy as jnp
+
+    imaging, mapper = _off_centre_imaging_and_mapper(kernel_shape=kernel_shape)
+    func = _func_list_from(imaging.mask)
+    mapper_jax = type(mapper)(
+        interpolator=mapper.interpolator,
+        regularization=mapper.regularization,
+        image_plane_mesh_grid=mapper.image_plane_mesh_grid,
+        xp=jnp,
+    )
+
+    dense = aa.Inversion(
+        dataset=imaging,
+        linear_obj_list=[func, mapper_jax],
+        settings=aa.Settings(use_positive_only_solver=False, use_mixed_precision=True),
+        xp=jnp,
+    )
+    sparse = aa.Inversion(
+        dataset=imaging,
+        linear_obj_list=[func, mapper_jax],
+        settings=aa.Settings(
+            use_positive_only_solver=False,
+            use_mixed_precision=True,
+            use_sparse_curvature=True,
+            sparse_curvature_mixed_precision=transposed_mixed,
+        ),
+        xp=jnp,
+    )
+
+    assert sparse._use_sparse_curvature
+
+    F_dense = np.asarray(dense.curvature_matrix)
+    F_sparse = np.asarray(sparse.curvature_matrix)
+
+    assert F_sparse.dtype == np.float64
+    assert F_sparse == pytest.approx(
+        F_dense, rel=1.0e-5, abs=1.0e-5 * np.abs(F_dense).max()
+    )
+    # The toy system (19 pixels, a 3x3 mesh, random data, the positive-negative solve) is
+    # ill-conditioned enough to amplify the 1e-7 of `F` by three orders of magnitude in the
+    # reconstruction; this is the fp32 amplification the fp64 default guards against.
+    assert np.asarray(sparse.reconstruction) == pytest.approx(
+        np.asarray(dense.reconstruction), rel=1.0e-2, abs=1.0e-6
+    )
+
+
+@requires_jax
+def test__sparse_curvature__jax__config_default_off_and_numpy_ignores_config(
+    masked_imaging_7x7, rectangular_mapper_7x7_3x3
+):
+    import jax
+
+    jax.config.update("jax_enable_x64", True)
+    import jax.numpy as jnp
+
+    assert aa.Settings().use_sparse_curvature is False
+    assert aa.Settings().sparse_curvature_mixed_precision is False
+
+    mapper_jax = type(rectangular_mapper_7x7_3x3)(
+        interpolator=rectangular_mapper_7x7_3x3.interpolator,
+        regularization=rectangular_mapper_7x7_3x3.regularization,
+        image_plane_mesh_grid=rectangular_mapper_7x7_3x3.image_plane_mesh_grid,
+        xp=jnp,
+    )
+
+    inversion = aa.Inversion(
+        dataset=masked_imaging_7x7, linear_obj_list=[mapper_jax], xp=jnp
+    )
+    assert not inversion._use_sparse_curvature
+
+    # A config-level `True` reaches a JAX inversion but not a NumPy one.
+    class _CfgOn(aa.Settings):
+        @property
+        def use_sparse_curvature(self):
+            return True  # as a `general.yaml` `use_sparse_curvature: true` would read
+
+    jax_on = aa.Inversion(
+        dataset=masked_imaging_7x7,
+        linear_obj_list=[mapper_jax],
+        settings=_CfgOn(),
+        xp=jnp,
+    )
+    numpy_cfg = aa.Inversion(
+        dataset=masked_imaging_7x7,
+        linear_obj_list=[rectangular_mapper_7x7_3x3],
+        settings=_CfgOn(),
+    )
+    assert jax_on._use_sparse_curvature
+    assert not numpy_cfg._use_sparse_curvature
