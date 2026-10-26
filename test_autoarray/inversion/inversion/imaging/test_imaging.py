@@ -683,6 +683,32 @@ def test__sparse_curvature__numpy__mapper_and_func_list_match_dense(
         _assert_sparse_matches_dense(dense=dense, sparse=sparse)
 
 
+def test__sparse_curvature__column_blocked_transposed_blur_matches_dense(
+    masked_imaging_7x7, rectangular_mapper_7x7_3x3, monkeypatch
+):
+    """
+    The transposed blur runs in column blocks; with a block smaller than the parameter count
+    (9 mesh + 2 func columns, blocks of 4: two full blocks and a partial one) the result is
+    unchanged.
+    """
+    from autoarray.inversion.inversion.imaging import inversion_imaging_util
+
+    monkeypatch.setattr(inversion_imaging_util, "SPARSE_TRANSPOSE_BLUR_COLUMNS", 4)
+
+    func = _func_list_from(masked_imaging_7x7.mask)
+    dense = aa.Inversion(
+        dataset=masked_imaging_7x7,
+        linear_obj_list=[func, rectangular_mapper_7x7_3x3],
+        settings=aa.Settings(use_positive_only_solver=False),
+    )
+    sparse = aa.Inversion(
+        dataset=masked_imaging_7x7,
+        linear_obj_list=[func, rectangular_mapper_7x7_3x3],
+        settings=aa.Settings(use_positive_only_solver=False, use_sparse_curvature=True),
+    )
+    _assert_sparse_matches_dense(dense=dense, sparse=sparse)
+
+
 def test__sparse_curvature__no_mapper_falls_back_to_dense(masked_imaging_7x7):
     func = _func_list_from(masked_imaging_7x7.mask)
 
