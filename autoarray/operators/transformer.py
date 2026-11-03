@@ -10,12 +10,16 @@ from autoarray.structures.grids.uniform_2d import Grid2D
 from autoarray.structures.visibilities import Visibilities
 
 from autoarray.structures.arrays import array_2d_util
+from autoarray.operators import nufft_cpu
 from autoarray.operators import transformer_util
+from autoarray.dataset.interferometer.primary_beam import primary_beam_slim_from
 
-# nufftax pulls in jax at import (~0.7s), which sessions that never touch an
-# interferometer transformer should not pay for — deferred to _load_nufftax(),
-# called from TransformerNUFFT's entry points (not only __init__, because
-# unpickled instances in multiprocessing workers never re-run __init__).
+# nufftax pulls in jax at import (~0.7s) and starts XLA, which sessions that
+# never touch an interferometer transformer should not pay for, and which the
+# NumPy path must never trigger (it runs finufft via `nufft_cpu` instead) —
+# deferred to _load_nufftax(), called from the JAX branches of
+# TransformerNUFFT's entry points (not from __init__, because unpickled
+# instances in multiprocessing workers never re-run __init__).
 _nufftax = None
 _nufftax_loaded = False
 
@@ -93,6 +97,13 @@ def _patch_nufftax_batchers():
         )
 
 
+def _require_nufftax():
+    """Returns `nufftax` for a JAX branch, raising `nufftax_exception` if it is not installed."""
+    if _load_nufftax() is None:
+        nufftax_exception()
+    return _nufftax
+
+
 def nufftax_exception():
     raise ModuleNotFoundError(
         "\n--------------------\n"
@@ -106,11 +117,68 @@ def nufftax_exception():
     )
 
 
-class TransformerDFT:
+class _PrimaryBeamMixin:
+    """
+    The primary-beam handling shared by `TransformerDFT` and `TransformerNUFFT`.
+
+    The primary beam `P` is stored on the slim (unmasked) real-space grid as
+    `primary_beam_slim`. When set, the forward transforms `visibilities_from` and
+    `transform_mapping_matrix` multiply their input by `P` on the slim grid before the
+    Fourier transform, so they compute `F P i` (the visibilities of the apparent sky) from the
+    true-sky image `i`. The adjoint `image_from` is left un-beamed: the dirty image, dirty
+    beam and the w-tilde precision operator are the same with and without `P`.
+    """
+
+    primary_beam_slim: Optional[np.ndarray] = None
+
+    def _primary_beam_slim_set(self, primary_beam):
+        self.primary_beam_slim = (
+            None
+            if primary_beam is None
+            else primary_beam_slim_from(
+                primary_beam=primary_beam, mask=self.real_space_mask
+            )
+        )
+
+    def with_primary_beam(self, primary_beam):
+        """
+        Returns a shallow copy of this transformer whose forward transforms apply the primary
+        beam `primary_beam` (an `Array2D` on the real-space mask, or a native / slim array), or
+        none if it is `None`.
+
+        This transformer is not modified, so a transformer shared between datasets (e.g. one
+        returned by a `transformer_class` lambda) is safe. Returns `self` when the primary beam
+        is `None` and this transformer has none, so the un-beamed path is unchanged.
+        """
+        if primary_beam is None and self.primary_beam_slim is None:
+            return self
+
+        transformer = copy.copy(self)
+        transformer._primary_beam_slim_set(primary_beam=primary_beam)
+
+        return transformer
+
+    def _image_slim_beamed_from(self, image_slim, xp=np):
+        """Returns `P * image_slim`, or `image_slim` unchanged when there is no primary beam."""
+        if self.primary_beam_slim is None:
+            return image_slim
+
+        return image_slim * xp.asarray(self.primary_beam_slim)
+
+    def _mapping_matrix_beamed_from(self, mapping_matrix, xp=np):
+        """Returns `diag(P) @ mapping_matrix`, or `mapping_matrix` unchanged when there is no primary beam."""
+        if self.primary_beam_slim is None:
+            return mapping_matrix
+
+        return mapping_matrix * xp.asarray(self.primary_beam_slim)[:, None]
+
+
+class TransformerDFT(_PrimaryBeamMixin):
     def __init__(
         self,
         uv_wavelengths: np.ndarray,
         real_space_mask: Mask2D,
+        primary_beam=None,
     ):
         """
         A direct Fourier transform (DFT) operator for radio interferometric imaging.
@@ -128,6 +196,11 @@ class TransformerDFT:
             The (u, v) coordinates in wavelengths of the measured visibilities.
         real_space_mask
             The real-space mask that defines the image grid and which pixels are valid.
+        primary_beam
+            The primary beam `P` of the antennas, an `Array2D` on `real_space_mask` (or a native /
+            slim array). When set, `visibilities_from` and `transform_mapping_matrix` multiply their
+            input by `P` before the transform; `image_from` stays the un-beamed adjoint. `None`
+            (default) applies no primary beam.
 
         Attributes
         ----------
@@ -153,6 +226,8 @@ class TransformerDFT:
         self.total_visibilities = uv_wavelengths.shape[0]
         self.total_image_pixels = self.real_space_mask.pixels_in_mask
 
+        self._primary_beam_slim_set(primary_beam=primary_beam)
+
     def visibilities_from(self, image: Array2D, xp=np) -> Visibilities:
         """
         Computes the visibilities from a real-space image using the direct Fourier transform (DFT).
@@ -166,13 +241,16 @@ class TransformerDFT:
             The real-space image to be transformed to the uv-plane. Must be defined on the
             same grid and mask as this transformer's `real_space_mask`.
 
+        If the transformer has a `primary_beam_slim` the image is multiplied by it on the slim
+        grid first, so the visibilities are those of the apparent sky `P * image`.
+
         Returns
         -------
         The complex visibilities resulting from the Fourier transform of the input image.
         """
 
         visibilities = transformer_util.visibilities_from(
-            image_1d=image.slim.array,
+            image_1d=self._image_slim_beamed_from(image.slim.array, xp=xp),
             grid_radians=self.grid.array,
             uv_wavelengths=self.uv_wavelengths,
             xp=xp,
@@ -187,6 +265,10 @@ class TransformerDFT:
         This is not a true inverse Fourier transform, but rather the adjoint operation, which maps
         complex visibilities back into image space. This is typically used as the first step
         in inverse imaging algorithms like CLEAN or regularized reconstruction.
+
+        The primary beam is deliberately not applied: this is the adjoint of the un-beamed
+        transform, so the dirty image, dirty beam and the w-tilde quantities built from it do
+        not depend on `primary_beam_slim`.
 
         Parameters
         ----------
@@ -229,18 +311,19 @@ class TransformerDFT:
         Returns
         -------
         A 2D complex-valued array of shape (n_visibilities, n_source_pixels) that maps source-plane basis
-        functions directly to the visibilities.
+        functions directly to the visibilities. If the transformer has a `primary_beam_slim` every
+        column is multiplied by it first, giving `F P M`.
         """
 
         return transformer_util.transformed_mapping_matrix_from(
-            mapping_matrix=mapping_matrix,
+            mapping_matrix=self._mapping_matrix_beamed_from(mapping_matrix, xp=xp),
             grid_radians=self.grid.array,
             uv_wavelengths=self.uv_wavelengths,
             xp=xp,
         )
 
 
-class TransformerNUFFT:
+class TransformerNUFFT(_PrimaryBeamMixin):
     def __init__(
         self,
         uv_wavelengths: np.ndarray,
@@ -248,16 +331,29 @@ class TransformerNUFFT:
         eps: float = 1e-12,
         chunk_size: Optional[int] = None,
         xp=np,
+        primary_beam=None,
         **kwargs,
     ):
         """
-        JAX-native Non-Uniform FFT for image -> visibilities, backed by `nufftax`.
+        Non-Uniform FFT for image -> visibilities, backed by `finufft` on the
+        NumPy path and `nufftax` on the JAX path.
 
-        This is the default `TransformerNUFFT` in PyAutoArray. It uses the
-        `nufftax` library (https://github.com/GragasLab/nufftax), a pure-JAX
-        NUFFT implementation that supports `jax.jit`, `jax.grad`, and
-        `jax.vmap`. Note that nufftax requires JAX; on platforms with no JAX
-        wheels (notably Intel macOS) use `TransformerDFT` instead.
+        This is the default `TransformerNUFFT` in PyAutoArray. The array
+        namespace of each call picks the backend:
+
+        - `xp=np` (eager NumPy) runs `finufft`
+          (https://github.com/flatironinstitute/finufft), the CPU C++ NUFFT,
+          via `autoarray.operators.nufft_cpu`. This path never imports JAX, so
+          a NumPy fit (e.g. a numba Nautilus search with forked workers) does
+          not start XLA in its parent process. `finufft` uses OpenMP and
+          honours `OMP_NUM_THREADS`.
+        - `xp=jnp` runs `nufftax` (https://github.com/GragasLab/nufftax), a
+          pure-JAX port of `finufft` that supports `jax.jit`, `jax.grad` and
+          `jax.vmap`. `nufftax` is imported only on this path.
+
+        The two agree to ~1e-14 relative. Where `finufft` has no wheel (e.g.
+        Linux aarch64) the NumPy path falls back to `nufftax` with a warning;
+        where neither is installed use `TransformerDFT` instead.
 
         Convention recipe (matches `TransformerDFT` to ~1e-13 relative across
         odd/even/non-square image sizes):
@@ -271,8 +367,8 @@ class TransformerNUFFT:
             visibilities = nufftax.nufft2d2(x, y, image_flipped, eps, -1) * shift
 
         The `shift` factor is the half-pixel correction between autoarray's
-        grid centre at index `(N - 1) / 2` and nufftax's mode-0 at index
-        `N // 2`; nufftax does not apply it internally.
+        grid centre at index `(N - 1) / 2` and the NUFFT's mode-0 at index
+        `N // 2`; neither backend applies it internally.
 
         Parameters
         ----------
@@ -282,14 +378,14 @@ class TransformerNUFFT:
         real_space_mask
             The 2D mask defining the real-space image grid.
         eps
-            Requested NUFFT precision passed to nufftax. Defaults to `1e-12`
+            Requested NUFFT precision passed to the backend. Defaults to `1e-12`
             (effectively machine precision); relax to `1e-9` or `1e-6` for
             faster execution if marginal accuracy is acceptable.
         chunk_size
             If set to a positive integer, the forward and adjoint NUFFT
             calls split the visibility axis into chunks of this size and
             iterate (via ``jax.lax.scan`` on the JAX path, a Python loop
-            on the numpy path). This caps the nufftax gather-buffer
+            on the numpy path). This caps the NUFFT gather-buffer
             allocation (~``2 * chunk_size * nspread^2 * dtype_size``) at
             the cost of per-chunk overhead. Required for visibility counts
             above ~5M on a 40-80 GB GPU. If ``None`` (default), a single
@@ -299,6 +395,11 @@ class TransformerNUFFT:
             Accepted for signature compatibility with the legacy class; not
             stored. The active backend is selected per-call via the `xp`
             argument to `visibilities_from` / `image_from`.
+        primary_beam
+            The primary beam `P` of the antennas, an `Array2D` on `real_space_mask` (or a native /
+            slim array). When set, `visibilities_from` and `transform_mapping_matrix` multiply their
+            input by `P` on the slim grid before the scatter to the native grid; `image_from` stays
+            the un-beamed adjoint. `None` (default) applies no primary beam.
 
         Attributes
         ----------
@@ -311,8 +412,10 @@ class TransformerNUFFT:
         """
         from astropy import units
 
-        if _load_nufftax() is None:
-            nufftax_exception()
+        # Checks that a backend exists without importing nufftax (and so JAX):
+        # NumPy users must not start XLA just by building a transformer.
+        if not nufft_cpu.backend_available():
+            nufft_cpu.nufft_cpu_exception()
 
         if chunk_size is not None and chunk_size <= 0:
             raise ValueError(
@@ -345,20 +448,23 @@ class TransformerNUFFT:
         self.total_visibilities = uv_wavelengths.shape[0]
         self.total_image_pixels = real_space_mask.pixels_in_mask
 
+        self._primary_beam_slim_set(primary_beam=primary_beam)
+
     def _forward_native(self, image_native_2d, xp=np):
         """Run nufft2d2 on a 2D native-shape image array, returning visibilities.
 
         When ``self.chunk_size`` is set, the visibility axis is processed in
         fixed-size chunks via ``jax.lax.scan`` (JAX path) or a Python loop
-        (numpy path) — caps the nufftax gather-buffer allocation per call.
+        (numpy path) — caps the NUFFT gather-buffer allocation per call. The
+        numpy path runs `finufft` (`nufft_cpu`), the JAX path `nufftax`.
         """
-        _load_nufftax()
-
         K = int(self._x.shape[0])
 
         if xp.__name__.startswith("jax"):
             import jax
             import jax.numpy as jnp
+
+            _require_nufftax()
 
             img = jnp.asarray(image_native_2d)[::-1, :].astype(jnp.complex128)
             x_all = jnp.asarray(self._x)
@@ -390,7 +496,7 @@ class TransformerNUFFT:
         img = image_native_2d[::-1, :].astype(np.complex128)
 
         if self.chunk_size is None or self.chunk_size >= K:
-            out = _nufftax.nufft2d2(self._x, self._y, img, self.eps, -1) * self._shift
+            out = nufft_cpu.nufft2d2(self._x, self._y, img, self.eps, -1) * self._shift
             return np.array(np.asarray(out))
 
         cs = int(self.chunk_size)
@@ -398,7 +504,7 @@ class TransformerNUFFT:
         for k0 in range(0, K, cs):
             k1 = min(k0 + cs, K)
             vis = (
-                _nufftax.nufft2d2(self._x[k0:k1], self._y[k0:k1], img, self.eps, -1)
+                nufft_cpu.nufft2d2(self._x[k0:k1], self._y[k0:k1], img, self.eps, -1)
                 * self._shift[k0:k1]
             )
             parts.append(np.asarray(vis))
@@ -412,16 +518,24 @@ class TransformerNUFFT:
         before being wrapped in `Visibilities`. For JAX callers (`xp=jnp`)
         the result stays as a `jax.Array` so it can flow through `jax.jit`
         / `jax.grad` / `jax.vmap` without device round-trips.
+
+        If the transformer has a `primary_beam_slim` the image is multiplied by it on the
+        slim grid before the scatter to the native grid, so the visibilities are those of
+        `P * image`.
         """
         if xp.__name__.startswith("jax"):
             import jax.numpy as jnp
 
             image_native = jnp.zeros(image.mask.shape, dtype=image.dtype)
             image_native = image_native.at[image.mask.slim_to_native_tuple].set(
-                image.array
+                self._image_slim_beamed_from(image.array, xp=xp)
             )
-        else:
+        elif self.primary_beam_slim is None:
             image_native = image.native.array
+        else:
+            image_slim = self._image_slim_beamed_from(image.slim.array, xp=np)
+            image_native = np.zeros(image.mask.shape, dtype=image_slim.dtype)
+            image_native[image.mask.slim_to_native_tuple] = image_slim
 
         return Visibilities(visibilities=self._forward_native(image_native, xp=xp))
 
@@ -433,7 +547,8 @@ class TransformerNUFFT:
         """
         Adjoint NUFFT: visibilities -> real-space (dirty) image.
 
-        Implemented as `nufftax.nufft2d1` with `conj(shift)` applied to the
+        Implemented as a type-1 `nufft2d1` (`finufft` via `nufft_cpu` for
+        `xp=np`, `nufftax` for `xp=jnp`) with `conj(shift)` applied to the
         visibilities and a final row-flip to return to autoarray's native
         orientation. The real part is taken to discard imaginary residue.
 
@@ -442,9 +557,11 @@ class TransformerNUFFT:
         `TransformerDFT.image_from` exactly, which is what makes
         `Interferometer.apply_sparse_operator` scale-consistent across both
         transformers.
-        """
-        _load_nufftax()
 
+        The primary beam is deliberately not applied: this is the adjoint of the
+        un-beamed transform, so the dirty image, dirty beam and the w-tilde quantities
+        built from it do not depend on `primary_beam_slim`.
+        """
         n_y, n_x = self.real_space_mask.shape_native
         n_modes = (n_x, n_y)  # nufftax wants (n1, n2) = (N_x, N_y)
         K = int(self._x.shape[0])
@@ -452,6 +569,8 @@ class TransformerNUFFT:
         if xp.__name__.startswith("jax"):
             import jax
             import jax.numpy as jnp
+
+            _require_nufftax()
 
             x_all = jnp.asarray(self._x)
             y_all = jnp.asarray(self._y)
@@ -490,7 +609,7 @@ class TransformerNUFFT:
         c_all = visibilities.array * np.conj(self._shift)
 
         if self.chunk_size is None or self.chunk_size >= K:
-            f = _nufftax.nufft2d1(self._x, self._y, c_all, n_modes, self.eps, +1)
+            f = nufft_cpu.nufft2d1(self._x, self._y, c_all, n_modes, self.eps, +1)
             image = np.array(np.asarray(f)[::-1, :].real)
             return Array2D(values=image, mask=self.real_space_mask)
 
@@ -498,7 +617,7 @@ class TransformerNUFFT:
         f_total = np.zeros((n_y, n_x), dtype=np.complex128)
         for k0 in range(0, K, cs):
             k1 = min(k0 + cs, K)
-            f_chunk = _nufftax.nufft2d1(
+            f_chunk = nufft_cpu.nufft2d1(
                 self._x[k0:k1], self._y[k0:k1], c_all[k0:k1], n_modes, self.eps, +1
             )
             f_total = f_total + np.asarray(f_chunk)
@@ -515,8 +634,13 @@ class TransformerNUFFT:
         per-column Python loop that, under ``jax.jit``, would unroll into
         ``n_src`` separate NUFFT invocations and blow up the JIT graph
         for pixelization-heavy fits (notably double-source-plane).
+
+        If the transformer has a `primary_beam_slim` every column is multiplied by it on
+        the slim grid before the scatter, giving `F P M`.
+
+        The numpy path runs `finufft` (`nufft_cpu`), the JAX path `nufftax`.
         """
-        _load_nufftax()
+        mapping_matrix = self._mapping_matrix_beamed_from(mapping_matrix, xp=xp)
 
         n_src = mapping_matrix.shape[1]
         rows, cols = self.real_space_mask.slim_to_native_tuple
@@ -524,6 +648,8 @@ class TransformerNUFFT:
 
         if xp.__name__.startswith("jax"):
             import jax.numpy as jnp
+
+            _require_nufftax()
 
             # Real scatter, then cast: GPU complex128 scatter floor (autolens_profiling#308).
             mm_T = jnp.asarray(mapping_matrix).T
@@ -549,7 +675,7 @@ class TransformerNUFFT:
         source_images[np.arange(n_src)[:, None], rows[None, :], cols[None, :]] = mm_T
         flipped = source_images[:, ::-1, :].astype(np.complex128)
         vis_batched = (
-            _nufftax.nufft2d2(self._x, self._y, flipped, self.eps, -1)
+            nufft_cpu.nufft2d2(self._x, self._y, flipped, self.eps, -1)
             * self._shift[None, :]
         )
         return np.array(np.asarray(vis_batched).T)

@@ -351,13 +351,18 @@ def test__apply_sparse_operator__disable_jax_overrides_an_explicit_use_jax(
 
     assert recorded == [False, True, True, True, True]
 
-    # The default builder is the type-1 NUFFT, which runs on JAX too (nufftax is a JAX library),
-    # so the same kill switch has to demote it to the NumPy brute force rather than to the JAX
-    # one. Nothing above tests that: `use_jax` only ever selected between the two brute forces.
+    # Under `use_jax=True` the type-1 NUFFT builder runs on nufftax (JAX), so the same kill switch
+    # has to demote it to the NumPy brute force rather than to the JAX one. The default
+    # `use_jax=False` builder runs on finufft, which is not JAX, so the switch leaves it alone.
     monkeypatch.setattr(aa.Interferometer, "psf_precision_operator_from", original)
 
     monkeypatch.setenv("PYAUTO_DISABLE_JAX", "1")
-    operator_under_kill_switch = np.asarray(dataset().psf_precision_operator_from())
+    operator_under_kill_switch = np.asarray(
+        dataset().psf_precision_operator_from(use_jax=True)
+    )
+    operator_default_under_kill_switch = np.asarray(
+        dataset().psf_precision_operator_from()
+    )
 
     monkeypatch.delenv("PYAUTO_DISABLE_JAX", raising=False)
     operator_via_numpy = np.asarray(
@@ -365,6 +370,13 @@ def test__apply_sparse_operator__disable_jax_overrides_an_explicit_use_jax(
     )
 
     np.testing.assert_array_equal(operator_under_kill_switch, operator_via_numpy)
+
+    pytest.importorskip("finufft")
+
+    np.testing.assert_array_equal(
+        operator_default_under_kill_switch,
+        np.asarray(dataset().psf_precision_operator_from()),
+    )
 
 
 def _interferometer_for_precision_operator(mask_2d_7x7, transformer_class):
@@ -466,14 +478,14 @@ def test__apply_sparse_operator__method_and_nufft_kwargs_reach_the_builder(mask_
     # The operator only keeps `Khat`, so the plumbing is checked through it: routing to the brute
     # force and to the NUFFT must give the same operator to the pin's tolerance.
     np.testing.assert_allclose(
-        np.asarray(dataset_default.sparse_operator.Khat),
-        np.asarray(dataset_via_numpy.sparse_operator.Khat),
+        np.asarray(dataset_default.sparse_operator.khat_np),
+        np.asarray(dataset_via_numpy.sparse_operator.khat_np),
         rtol=1.0e-10,
         atol=1.0e-10 * np.abs(operator_via_numpy[0, 0]),
     )
     np.testing.assert_allclose(
-        np.asarray(dataset_chunked.sparse_operator.Khat),
-        np.asarray(dataset_default.sparse_operator.Khat),
+        np.asarray(dataset_chunked.sparse_operator.khat_np),
+        np.asarray(dataset_default.sparse_operator.khat_np),
         rtol=1.0e-10,
         atol=1.0e-10 * np.abs(operator_via_numpy[0, 0]),
     )
@@ -1253,3 +1265,231 @@ def test__apply_sparse_operator_from_chunks__pool_noise_map__raises(mask_2d_7x7)
         dataset.apply_sparse_operator_from_chunks(
             _chunks_of(dataset, [0, 40]), pool_noise_map=True, method="numpy"
         )
+
+
+def _primary_beam_from(mask, seed=8):
+    """A non-trivial primary beam on the unmasked pixels of `mask`, with values in (0.2, 1]."""
+    return aa.Array2D(
+        values=np.random.default_rng(seed=seed).uniform(
+            0.2, 1.0, size=mask.pixels_in_mask
+        ),
+        mask=mask,
+    )
+
+
+def _assert_carries_primary_beam(dataset, primary_beam_slim):
+    assert np.array_equal(dataset.primary_beam_slim, primary_beam_slim)
+    assert np.array_equal(dataset.sparse_operator.primary_beam_slim, primary_beam_slim)
+
+    if dataset.transformer is not None:
+        assert np.array_equal(dataset.transformer.primary_beam_slim, primary_beam_slim)
+
+
+def test__primary_beam__native_and_slim_accepted_and_applied_to_the_transformer(
+    mask_2d_7x7,
+):
+    primary_beam = _primary_beam_from(mask_2d_7x7)
+
+    for value in (
+        primary_beam,
+        primary_beam.native,
+        primary_beam.array,
+        primary_beam.native.array,
+    ):
+        dataset = _random_interferometer(mask_2d_7x7, transformer.TransformerDFT)
+        dataset = aa.Interferometer(
+            data=dataset.data,
+            noise_map=dataset.noise_map,
+            uv_wavelengths=dataset.uv_wavelengths,
+            real_space_mask=mask_2d_7x7,
+            transformer_class=transformer.TransformerDFT,
+            primary_beam=value,
+        )
+
+        assert dataset.primary_beam_slim.shape == (mask_2d_7x7.pixels_in_mask,)
+        assert np.array_equal(dataset.primary_beam_slim, primary_beam.array)
+        assert np.array_equal(
+            dataset.transformer.primary_beam_slim, primary_beam.array
+        )
+
+    dataset = _random_interferometer(mask_2d_7x7, transformer.TransformerDFT)
+
+    assert dataset.primary_beam is None
+    assert dataset.primary_beam_slim is None
+    assert dataset.transformer.primary_beam_slim is None
+
+
+def test__primary_beam__shape_mismatch__raises(mask_2d_7x7):
+    dataset = _random_interferometer(mask_2d_7x7, transformer.TransformerDFT)
+
+    for value in (np.ones((5, 5)), np.ones(mask_2d_7x7.pixels_in_mask + 1)):
+        with pytest.raises(aa.exc.DatasetException):
+            aa.Interferometer(
+                data=dataset.data,
+                noise_map=dataset.noise_map,
+                uv_wavelengths=dataset.uv_wavelengths,
+                real_space_mask=mask_2d_7x7,
+                transformer_class=transformer.TransformerDFT,
+                primary_beam=value,
+            )
+
+
+def test__primary_beam__zero_unmasked_value__warns(mask_2d_7x7):
+    dataset = _random_interferometer(mask_2d_7x7, transformer.TransformerDFT)
+
+    primary_beam = _primary_beam_from(mask_2d_7x7).array.copy()
+    primary_beam[0] = 0.0
+
+    with pytest.warns(UserWarning, match="primary beam"):
+        dataset_beamed = aa.Interferometer(
+            data=dataset.data,
+            noise_map=dataset.noise_map,
+            uv_wavelengths=dataset.uv_wavelengths,
+            real_space_mask=mask_2d_7x7,
+            transformer_class=transformer.TransformerDFT,
+            primary_beam=primary_beam,
+        )
+
+    # No floor is applied.
+    assert dataset_beamed.primary_beam_slim[0] == 0.0
+
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+
+        aa.Interferometer(
+            data=dataset.data,
+            noise_map=dataset.noise_map,
+            uv_wavelengths=dataset.uv_wavelengths,
+            real_space_mask=mask_2d_7x7,
+            transformer_class=transformer.TransformerDFT,
+            primary_beam=_primary_beam_from(mask_2d_7x7),
+        )
+
+
+def test__primary_beam__dirty_image_and_dirty_beam_unchanged(mask_2d_7x7):
+    dataset = _random_interferometer(mask_2d_7x7, transformer.TransformerDFT)
+
+    dataset_beamed = aa.Interferometer(
+        data=dataset.data,
+        noise_map=dataset.noise_map,
+        uv_wavelengths=dataset.uv_wavelengths,
+        real_space_mask=mask_2d_7x7,
+        transformer_class=transformer.TransformerDFT,
+        primary_beam=_primary_beam_from(mask_2d_7x7),
+    )
+
+    for name in ("dirty_image", "dirty_image_natural", "dirty_beam"):
+        assert np.array_equal(
+            getattr(dataset_beamed, name).array, getattr(dataset, name).array
+        ), name
+
+    sparse = dataset.apply_sparse_operator(use_jax=False).sparse_operator
+    sparse_beamed = dataset_beamed.apply_sparse_operator(use_jax=False).sparse_operator
+
+    assert np.array_equal(sparse_beamed.dirty_image, sparse.dirty_image)
+    assert np.array_equal(
+        sparse_beamed.nufft_precision_operator, sparse.nufft_precision_operator
+    )
+    assert sparse_beamed.data_term == sparse.data_term
+    assert sparse.primary_beam_slim is None
+
+
+def test__primary_beam__propagates_through_every_reconstruction_site(
+    mask_2d_7x7, tmp_path
+):
+    pytest.importorskip("nufftax")
+
+    primary_beam = _primary_beam_from(mask_2d_7x7)
+
+    dataset = _random_interferometer(mask_2d_7x7, transformer.TransformerNUFFT)
+    dataset = aa.Interferometer(
+        data=dataset.data,
+        noise_map=dataset.noise_map,
+        uv_wavelengths=dataset.uv_wavelengths,
+        real_space_mask=mask_2d_7x7,
+        transformer_class=transformer.TransformerNUFFT,
+        primary_beam=primary_beam,
+    )
+
+    # apply_sparse_operator.
+    _assert_carries_primary_beam(
+        dataset.apply_sparse_operator(use_jax=False), primary_beam.array
+    )
+
+    # The pooled-noise branch.
+    _assert_carries_primary_beam(
+        dataset.apply_sparse_operator(use_jax=False, pool_noise_map=True),
+        primary_beam.array,
+    )
+
+    # apply_sparse_operator_from_chunks.
+    chunks = _chunks_of(dataset, [0, 13, 40])
+
+    _assert_carries_primary_beam(
+        dataset.apply_sparse_operator_from_chunks(chunks), primary_beam.array
+    )
+
+    # from_stream and from_sparse_terms (array-free).
+    dataset_stream = aa.Interferometer.from_stream(
+        _chunks_of(dataset, [0, 13, 40]), mask_2d_7x7, primary_beam=primary_beam
+    )
+
+    _assert_carries_primary_beam(dataset_stream, primary_beam.array)
+
+    dataset_terms = aa.Interferometer.from_sparse_terms(
+        dataset_stream.sparse_terms, mask_2d_7x7, primary_beam=primary_beam.native
+    )
+
+    _assert_carries_primary_beam(dataset_terms, primary_beam.array)
+
+    # from_fits with a primary_beam_path.
+    from astropy.io import fits
+
+    paths = {}
+
+    for name, values in (
+        ("data", np.stack([dataset.data.array.real, dataset.data.array.imag], 1)),
+        (
+            "noise_map",
+            np.stack([dataset.noise_map.array.real, dataset.noise_map.array.imag], 1),
+        ),
+        ("uv_wavelengths", dataset.uv_wavelengths),
+        ("primary_beam", primary_beam.native.array),
+    ):
+        paths[name] = tmp_path / f"{name}.fits"
+        fits.PrimaryHDU(data=values).writeto(paths[name], overwrite=True)
+
+    dataset_fits = aa.Interferometer.from_fits(
+        data_path=paths["data"],
+        noise_map_path=paths["noise_map"],
+        uv_wavelengths_path=paths["uv_wavelengths"],
+        real_space_mask=mask_2d_7x7,
+        primary_beam_path=paths["primary_beam"],
+    )
+
+    assert np.array_equal(dataset_fits.primary_beam_slim, primary_beam.array)
+    assert np.array_equal(
+        dataset_fits.transformer.primary_beam_slim, primary_beam.array
+    )
+
+    # A precomputed operator without a primary beam picks up the dataset's.
+    operator = (
+        _random_interferometer(mask_2d_7x7, transformer.TransformerNUFFT)
+        .apply_sparse_operator(use_jax=False)
+        .sparse_operator
+    )
+
+    dataset_cached = aa.Interferometer(
+        data=dataset.data,
+        noise_map=dataset.noise_map,
+        uv_wavelengths=dataset.uv_wavelengths,
+        real_space_mask=mask_2d_7x7,
+        transformer_class=transformer.TransformerNUFFT,
+        sparse_operator=operator,
+        primary_beam=primary_beam,
+    )
+
+    _assert_carries_primary_beam(dataset_cached, primary_beam.array)
+    assert operator.primary_beam_slim is None

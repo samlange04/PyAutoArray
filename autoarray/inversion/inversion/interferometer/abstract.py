@@ -15,6 +15,28 @@ from autoarray.structures.arrays.uniform_2d import Array2D
 from autoarray.inversion.inversion import inversion_util
 
 
+def real_space_mask_from(dataset) -> Mask2D:
+    """
+    The real-space mask an interferometer inversion of `dataset` reconstructs on: an
+    `Interferometer`'s `real_space_mask`, else a transformer's `real_space_mask`, else the
+    dataset's own `mask` (a `DatasetInterface`'s `grids.lp.mask`).
+
+    A module function so the inversion factory can read the same mask before it builds an
+    inversion (`AbstractInversionInterferometer.mask` returns this).
+    """
+    real_space_mask = getattr(dataset, "real_space_mask", None)
+
+    if real_space_mask is not None:
+        return real_space_mask
+
+    transformer = getattr(dataset, "transformer", None)
+
+    if transformer is not None:
+        return transformer.real_space_mask
+
+    return dataset.mask
+
+
 class AbstractInversionInterferometer(AbstractInversion):
     def __init__(
         self,
@@ -70,17 +92,7 @@ class AbstractInversionInterferometer(AbstractInversion):
         `real_space_mask`, else the dataset's own `mask` (a `DatasetInterface`'s
         `grids.lp.mask`).
         """
-        real_space_mask = getattr(self.dataset, "real_space_mask", None)
-
-        if real_space_mask is not None:
-            return real_space_mask
-
-        transformer = getattr(self.dataset, "transformer", None)
-
-        if transformer is not None:
-            return transformer.real_space_mask
-
-        return self.dataset.mask
+        return real_space_mask_from(dataset=self.dataset)
 
     @cached_property
     def operated_mapping_matrix_list(self) -> List[np.ndarray]:
@@ -95,7 +107,9 @@ class AbstractInversionInterferometer(AbstractInversion):
         A linear object may have a `operated_mapping_matrix_override` property, which bypasses the `mapping_matrix`
         computation and transformer operation and is directly placed in the `operated_mapping_matrix_list`. Because
         the override bypasses the transformer it must already be in the data's visibility space, with (complex)
-        shape [total_visibilities, params] (e.g. computed via an analytic Fourier transform).
+        shape [total_visibilities, params] (e.g. computed via an analytic Fourier transform). The dataset's primary
+        beam is not applied to the override either (the transformer applies it to every other linear object), so
+        an override for a dataset with a `primary_beam` must already include it; that is the caller's job.
         """
         operated_mapping_matrix_list = []
 

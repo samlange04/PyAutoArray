@@ -17,6 +17,7 @@ from .dataset.imaging.dataset import Imaging
 from .dataset.imaging.simulator import SimulatorImaging
 from .dataset.interferometer.dataset import Interferometer
 from .dataset.interferometer.simulator import SimulatorInterferometer
+from .dataset.interferometer.primary_beam import primary_beam_gaussian_from
 from .dataset.dataset_model import DatasetModel
 from .fit.fit_dataset import AbstractFit
 from .fit.fit_dataset import FitDataset
@@ -49,6 +50,9 @@ from .inversion.inversion.imaging.sparse import InversionImagingSparse
 from .inversion.inversion.imaging.inversion_imaging_util import ImagingSparseOperator
 from .inversion.inversion.interferometer.sparse import (
     InversionInterferometerSparse,
+)
+from .inversion.inversion.interferometer.matrix_free import (
+    InversionInterferometerMatrixFree,
 )
 from .inversion.inversion.interferometer.mapping import InversionInterferometerMapping
 from .inversion.inversion.interferometer.inversion_interferometer_util import (

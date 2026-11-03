@@ -1,6 +1,7 @@
 import numpy as np
 from typing import List, Optional, Tuple, Union
 
+from autoarray import exc
 from autoarray.dataset.imaging.dataset import Imaging
 from autoarray.dataset.interferometer.dataset import Interferometer
 from autoarray.inversion.inversion.imaging.mapping import InversionImagingMapping
@@ -11,8 +12,17 @@ from autoarray.inversion.inversion.interferometer.mapping import (
 from autoarray.inversion.inversion.interferometer.sparse import (
     InversionInterferometerSparse,
 )
+from autoarray.inversion.inversion.interferometer.abstract import (
+    real_space_mask_from,
+)
 from autoarray.inversion.inversion.interferometer_numba.sparse import (
     InversionInterferometerSparseNumba,
+)
+from autoarray.inversion.inversion.interferometer.matrix_free import (
+    InversionInterferometerMatrixFree,
+)
+from autoarray.inversion.inversion.interferometer_numba import (
+    sparse as interferometer_numba_sparse,
 )
 from autoarray.inversion.inversion.interferometer_numba import (
     inversion_interferometer_numba_util,
@@ -163,6 +173,16 @@ def inversion_imaging_from(
     )
 
 
+def primary_beam_is_trivial(primary_beam_slim) -> bool:
+    """
+    Whether a primary beam leaves the interferometer response unchanged: `None`, or every value exactly 1.
+    """
+    if primary_beam_slim is None:
+        return True
+
+    return bool(np.all(np.asarray(primary_beam_slim) == 1.0))
+
+
 def inversion_interferometer_from(
     dataset: Union[Interferometer, DatasetInterface],
     linear_obj_list: List[LinearObj],
@@ -208,15 +228,41 @@ def inversion_interferometer_from(
     # `transform_mapping_matrix` of shape (N_vis, S), which dominates run time and memory at large N_vis, and
     # `InversionInterferometerSparse` handles zero mappers (the func-func curvature blocks and the data vector
     # need no mapper). `_use_interferometer_numba` returns False whenever a func-list is present.
+    route_is_matrix_free = (
+        settings is not None and settings.interferometer_route == "matrix_free"
+    )
+
     if dataset.sparse_operator is not None:
 
-        if _use_interferometer_numba(
+        # The matrix-free route is opt-in only. `InversionInterferometerMatrixFree` raises on
+        # every configuration it cannot represent (JAX, linear functions, several mappers, a
+        # non-rectangular mesh, a regularization without a sparse form, ...); there is no silent
+        # fallback to the dense routes.
+        if route_is_matrix_free:
+            return InversionInterferometerMatrixFree(
+                dataset=dataset,
+                linear_obj_list=linear_obj_list,
+                settings=settings,
+                xp=xp,
+                preloads=preloads,
+            )
+
+        # The numba `direct_conv` kernel uses the mapper weights as-is and cannot apply a primary
+        # beam, so a dataset with a non-trivial one (any value other than 1) always takes the FFT
+        # sparse route. `P = ones` keeps the numba route, so it is bit-for-bit `P = None`.
+        if primary_beam_is_trivial(
+            getattr(dataset.sparse_operator, "primary_beam_slim", None)
+        ) and _use_interferometer_numba(
             linear_obj_list=linear_obj_list,
             settings=settings,
             xp=xp,
             extent_shape=(
                 dataset.sparse_operator.y_shape,
                 dataset.sparse_operator.x_shape,
+            ),
+            # Only the NumPy cost model reads the mask, so the JAX path never resolves it.
+            real_space_mask=(
+                real_space_mask_from(dataset=dataset) if xp is np else None
             ),
         ):
             return InversionInterferometerSparseNumba(
@@ -235,6 +281,14 @@ def inversion_interferometer_from(
             preloads=preloads,
         )
 
+    if route_is_matrix_free:
+        raise exc.InversionException(
+            '`Settings(interferometer_route="matrix_free")` was set but the interferometer '
+            "dataset has no `sparse_operator`. The matrix-free route reads the w-tilde kernel "
+            "and dirty image from it; call `dataset.apply_sparse_operator(...)` first, or use "
+            '`interferometer_route="fft"` (or leave it unset).'
+        )
+
     return InversionInterferometerMapping(
         dataset=dataset,
         linear_obj_list=linear_obj_list,
@@ -248,6 +302,7 @@ def _use_interferometer_numba(
     settings: Settings = None,
     xp=np,
     extent_shape: Optional[Tuple[int, int]] = None,
+    real_space_mask=None,
 ) -> bool:
     """
     Whether an interferometer inversion is routed to the numba `direct_conv` curvature
@@ -281,7 +336,14 @@ def _use_interferometer_numba(
         which predicts both routes' time from the source pixels, the mapping operator's
         non-zeros and the extent rectangle `extent_shape`, and routes to numba when
         `direct_conv` is predicted no slower. Without an `extent_shape` the model cannot
-        be evaluated and the FFT route is used.
+        be evaluated and the FFT route is used. When numba is serial and
+        `interferometer_direct_conv_symmetric_max_work_fraction` is positive, the
+        symmetric kernel's work fraction is computed from the mapper's triplets and
+        `real_space_mask` (`symmetric_work_fraction_from`), and if it is at or below that
+        threshold -- i.e. `InversionInterferometerSparseNumba` will run the cheaper
+        symmetric kernel -- it is passed to the cost model, which scales the predicted
+        `direct_conv` time by it. Without a `real_space_mask` whose extent matches
+        `extent_shape`, the full kernel's cost is predicted.
     - `import numba` succeeds.
 
     NaN mapping weights (an overflowing or degenerate `DelaunayNN` Sibson row) are
@@ -304,6 +366,9 @@ def _use_interferometer_numba(
         The `(ny, nx)` extent rectangle the `W~` operator lives on, i.e. the dataset's
         `sparse_operator.y_shape, sparse_operator.x_shape`
         (`= mask.shape_native_masked_pixels`). Needed only by the default cost model.
+    real_space_mask
+        The real-space mask the inversion reconstructs on (`real_space_mask_from`), used
+        only by the default cost model for the symmetric kernel's work fraction.
     """
     if xp is not np:
         return False
@@ -360,6 +425,12 @@ def _use_interferometer_numba(
                     source_pixels=int(mapper.params),
                     nnz=int(np.asarray(mapper.pix_sizes_for_sub_slim_index).sum()),
                     extent_shape=extent_shape,
+                    work_fraction=_symmetric_work_fraction_for_route(
+                        mapper=mapper,
+                        settings=settings,
+                        extent_shape=extent_shape,
+                        real_space_mask=real_space_mask,
+                    ),
                 )
             )
 
@@ -372,3 +443,56 @@ def _use_interferometer_numba(
         return False
 
     return True
+
+
+def _symmetric_work_fraction_for_route(
+    mapper, settings: Settings, extent_shape, real_space_mask
+) -> Optional[float]:
+    """
+    The work fraction to give the route cost model: the symmetric kernel's
+    `work_fraction` when `InversionInterferometerSparseNumba` would run it (serial numba,
+    the gate positive, finite weights and the fraction at or below it), else `None`
+    (predict the full kernel).
+
+    Computed from the mapper's triplets and the mask's extent indices, with the same
+    statistics the inversion's `symmetric_restriction_inputs` uses, so the gate here and
+    the kernel choice there cannot disagree.
+    """
+    threshold = settings.interferometer_direct_conv_symmetric_max_work_fraction
+
+    if (
+        threshold <= 0.0
+        or real_space_mask is None
+        or interferometer_numba_sparse._numba_parallel()
+    ):
+        return None
+
+    if tuple(int(n) for n in real_space_mask.shape_native_masked_pixels) != tuple(
+        int(n) for n in extent_shape
+    ):
+        return None
+
+    # Non-finite weights make the inversion fall back to the full kernel.
+    sizes = np.asarray(mapper.pix_sizes_for_sub_slim_index)
+    weights = np.asarray(mapper.pix_weights_for_sub_slim_index)
+    valid = np.arange(weights.shape[1])[None, :] < sizes[:, None]
+
+    if not np.all(np.isfinite(weights[valid])):
+        return None
+
+    extent_index_for_masked_pixel = np.asarray(
+        real_space_mask.extent_index_for_masked_pixel
+    )[np.asarray(mapper.slim_index_for_sub_slim_index)]
+
+    work_fraction = inversion_interferometer_numba_util.symmetric_work_fraction_from(
+        pix_indexes_for_sub_slim_index=mapper.pix_indexes_for_sub_slim_index,
+        pix_sizes_for_sub_slim_index=mapper.pix_sizes_for_sub_slim_index,
+        extent_index_for_masked_pixel=extent_index_for_masked_pixel,
+        extent_shape=extent_shape,
+        pix_pixels=int(mapper.params),
+    )
+
+    if work_fraction > threshold:
+        return None
+
+    return work_fraction

@@ -562,6 +562,11 @@ def test__nufft_precision_operator_from__method_routes_to_each_builder():
             **inputs
         )
     )
+    operator_via_nufft_jax = np.asarray(
+        aa.util.inversion_interferometer.nufft_precision_operator_via_nufft_from(
+            **inputs, use_jax=True
+        )
+    )
 
     # `"numpy"` and `"jax"` are pure routing, so they return the brute-force arrays unchanged.
     np.testing.assert_array_equal(
@@ -581,8 +586,7 @@ def test__nufft_precision_operator_from__method_routes_to_each_builder():
         operator_via_jax,
     )
 
-    # `use_jax=True` only upgrades a brute-force method, so `method="numpy"` with it set is
-    # the JAX brute force.
+    # `use_jax=True` upgrades `method="numpy"` to the JAX brute force.
     np.testing.assert_array_equal(
         np.asarray(
             aa.util.inversion_interferometer.nufft_precision_operator_from(
@@ -592,23 +596,23 @@ def test__nufft_precision_operator_from__method_routes_to_each_builder():
         operator_via_jax,
     )
 
-    # Under the default `method="nufft"` it is ignored -- the NUFFT already runs on JAX, so
-    # honouring it there would demote every existing `use_jax=True` caller (the workspace
-    # `apply_sparse_operator(use_jax=True)` calls) from seconds to the O(N_pix * K) brute force.
+    # Under the default `method="nufft"` it selects the nufftax NUFFT -- still a fast path, so
+    # every existing `use_jax=True` caller (the workspace `apply_sparse_operator(use_jax=True)`
+    # calls) keeps seconds rather than being demoted to the O(N_pix * K) brute force.
     operator_use_jax = np.asarray(
         aa.util.inversion_interferometer.nufft_precision_operator_from(
             use_jax=True, **inputs
         )
     )
 
-    np.testing.assert_array_equal(operator_use_jax, operator_via_nufft)
+    np.testing.assert_array_equal(operator_use_jax, operator_via_nufft_jax)
     _assert_matches_brute_force(operator_use_jax, operator_via_np)
 
     # The control: the NUFFT array is not the JAX brute-force array, so the assertion above is
     # testing the routing and not two builders that happen to agree bitwise.
     assert not np.array_equal(operator_use_jax, operator_via_jax)
 
-    # The default is the NUFFT builder, and it agrees with the brute force.
+    # The default is the NUFFT builder on finufft, and it agrees with the brute force.
     operator_default = np.asarray(
         aa.util.inversion_interferometer.nufft_precision_operator_from(**inputs)
     )
@@ -635,15 +639,13 @@ def test__nufft_precision_operator_from__disable_jax_falls_back_to_the_numpy_bui
         aa.util.inversion_interferometer.nufft_precision_operator_via_np_from(**inputs)
     )
 
-    # `PYAUTO_DISABLE_JAX=1` is the harness-level kill switch. Both the default NUFFT builder and
-    # the `"jax"` brute force run on JAX, so both must fall back -- and loudly, because the NumPy
-    # brute force is O(N_pix * K) where the NUFFT is O(K * nspread^2 + M log M). `use_jax=True`
-    # falls back either way: ignored under the default, and demoted again when it upgrades
-    # `method="numpy"` to the JAX brute force.
+    # `PYAUTO_DISABLE_JAX=1` is the harness-level kill switch. Every route that runs on JAX --
+    # the `"jax"` brute force and the nufftax NUFFT (`use_jax=True`) -- must fall back, and
+    # loudly, because the NumPy brute force is O(N_pix * K) where the NUFFT is
+    # O(K * nspread^2 + M log M).
     monkeypatch.setenv("PYAUTO_DISABLE_JAX", "1")
 
     for kwargs in (
-        {},
         {"method": "jax"},
         {"use_jax": True},
         {"method": "numpy", "use_jax": True},
@@ -660,11 +662,44 @@ def test__nufft_precision_operator_from__disable_jax_falls_back_to_the_numpy_bui
         np.testing.assert_array_equal(operator, operator_via_np)
         assert "PYAUTO_DISABLE_JAX" in caplog.text
 
+    # The default NUFFT builder runs on finufft, which is not JAX, so the switch leaves it alone.
+    # Only when finufft is missing (and the NumPy NUFFT would fall back to nufftax) is it demoted.
+    if aa.util.inversion_interferometer.nufft_cpu._load_finufft() is not None:
+        caplog.clear()
+
+        with caplog.at_level("WARNING"):
+            operator = np.asarray(
+                aa.util.inversion_interferometer.nufft_precision_operator_from(**inputs)
+            )
+
+        np.testing.assert_array_equal(
+            operator,
+            np.asarray(
+                aa.util.inversion_interferometer.nufft_precision_operator_via_nufft_from(
+                    **inputs
+                )
+            ),
+        )
+        assert "PYAUTO_DISABLE_JAX" not in caplog.text
+
+    monkeypatch.setattr(
+        aa.util.inversion_interferometer.nufft_cpu, "_load_finufft", lambda: None
+    )
+    caplog.clear()
+
+    with caplog.at_level("WARNING"):
+        operator = np.asarray(
+            aa.util.inversion_interferometer.nufft_precision_operator_from(**inputs)
+        )
+
+    np.testing.assert_array_equal(operator, operator_via_np)
+    assert "PYAUTO_DISABLE_JAX" in caplog.text
+
+    monkeypatch.undo()
+
     # Without the variable the default is the NUFFT builder again, so the fallback is the switch's
     # doing and not a permanent demotion.
-    monkeypatch.delenv("PYAUTO_DISABLE_JAX", raising=False)
-
-    pytest.importorskip("nufftax")
+    pytest.importorskip("finufft")
 
     np.testing.assert_array_equal(
         np.asarray(
@@ -687,13 +722,15 @@ def test__nufft_precision_operator_from__nufftax_absent_falls_back_to_the_numpy_
         aa.util.inversion_interferometer.nufft_precision_operator_via_np_from(**inputs)
     )
 
-    # `nufftax` is an optional dependency, so the default builder has to survive its absence --
-    # loudly, naming the O(N_pix * K) cost the caller now pays, rather than silently.
+    # `nufftax` is an optional dependency, so the `use_jax=True` NUFFT route has to survive its
+    # absence -- loudly, naming the O(N_pix * K) cost the caller now pays, rather than silently.
     monkeypatch.setattr(aa.util.inversion_interferometer, "_load_nufftax", lambda: None)
 
     with caplog.at_level("WARNING"):
         operator = np.asarray(
-            aa.util.inversion_interferometer.nufft_precision_operator_from(**inputs)
+            aa.util.inversion_interferometer.nufft_precision_operator_from(
+                use_jax=True, **inputs
+            )
         )
 
     np.testing.assert_array_equal(operator, operator_via_np)
@@ -702,8 +739,35 @@ def test__nufft_precision_operator_from__nufftax_absent_falls_back_to_the_numpy_
     # The builder itself raises rather than falling back: only the dispatcher chooses.
     with pytest.raises(ModuleNotFoundError):
         aa.util.inversion_interferometer.nufft_precision_operator_via_nufft_from(
-            **inputs
+            **inputs, use_jax=True
         )
+
+    # The default route runs on finufft and does not need nufftax at all.
+    if aa.util.inversion_interferometer.nufft_cpu._load_finufft() is not None:
+        np.testing.assert_array_equal(
+            np.asarray(
+                aa.util.inversion_interferometer.nufft_precision_operator_from(**inputs)
+            ),
+            np.asarray(
+                aa.util.inversion_interferometer.nufft_precision_operator_via_nufft_from(
+                    **inputs
+                )
+            ),
+        )
+
+    # With no NUFFT backend at all the default route falls back to the brute force too.
+    monkeypatch.setattr(
+        aa.util.inversion_interferometer.nufft_cpu, "backend_available", lambda: False
+    )
+    caplog.clear()
+
+    with caplog.at_level("WARNING"):
+        operator = np.asarray(
+            aa.util.inversion_interferometer.nufft_precision_operator_from(**inputs)
+        )
+
+    np.testing.assert_array_equal(operator, operator_via_np)
+    assert "finufft" in caplog.text
 
 
 def _numpy_backend_fixtures():
@@ -2069,9 +2133,10 @@ def test__nufft_precision_operator_via_nufft__type1_core_refactor_is_bit_for_bit
 
     for inputs in (_nufft_pin_inputs_7x7(), _nufft_pin_inputs_16x16()):
         for chunk_size in (None, 64):
+            # The reference is the nufftax loop, so it pins the `use_jax=True` route.
             np.testing.assert_array_equal(
                 aa.util.inversion_interferometer.nufft_precision_operator_via_nufft_from(
-                    **inputs, chunk_size=chunk_size
+                    **inputs, chunk_size=chunk_size, use_jax=True
                 ),
                 _nufft_precision_operator_via_nufft_reference_from(
                     **inputs, chunk_size=chunk_size
@@ -2486,3 +2551,69 @@ def test__interferometer__from_stream_and_apply_sparse_operator_from_chunks__pas
             rtol=1.0e-12,
             atol=1.0e-12 * np.abs(reference.dirty_image_fine).max(),
         )
+
+
+def test__sparse_triplets_from__slim_weights_scale_vals_by_their_slim_row():
+    """
+    `slim_weights` (the interferometer primary beam) multiplies each triplet's value by the weight of its
+    slim image pixel, giving the triplets of `diag(w) A`; `None` and ones leave the triplets bit-for-bit
+    unchanged. Checked on both the NumPy and (when available) JAX branches.
+    """
+    mask = aa.Mask2D.circular(shape_native=(10, 10), pixel_scales=1.0, radius=3.5)
+
+    grid = aa.Grid2D.from_mask(mask=mask, over_sample_size=2)
+
+    image_mesh_grid = aa.image_mesh.Overlay(shape=(4, 4)).image_plane_mesh_grid_from(
+        mask=mask, adapt_data=None
+    )
+    interpolator = aa.mesh.Delaunay(pixels=16).interpolator_from(
+        source_plane_data_grid=grid,
+        source_plane_mesh_grid=image_mesh_grid,
+    )
+    mapper = aa.Mapper(interpolator=interpolator)
+
+    weights = np.random.default_rng(seed=3).uniform(0.2, 1.0, size=mask.pixels_in_mask)
+
+    xps = [np]
+
+    try:
+        import jax.numpy as jnp
+
+        xps.append(jnp)
+    except ModuleNotFoundError:
+        pass
+
+    for xp in xps:
+
+        def triplets_from(slim_weights, return_rows_slim):
+            return [
+                np.asarray(array)
+                for array in aa.util.mapper.sparse_triplets_from(
+                    pix_indexes_for_sub=mapper.pix_indexes_for_sub_slim_index,
+                    pix_weights_for_sub=mapper.pix_weights_for_sub_slim_index,
+                    slim_index_for_sub=mapper.slim_index_for_sub_slim_index,
+                    fft_index_for_masked_pixel=mask.extent_index_for_masked_pixel,
+                    sub_fraction_slim=mapper.over_sampler.sub_fraction.array,
+                    return_rows_slim=return_rows_slim,
+                    slim_weights=slim_weights,
+                    xp=xp,
+                )
+            ]
+
+        rows_slim, cols, vals = triplets_from(None, return_rows_slim=True)
+
+        _, cols_weighted, vals_weighted = triplets_from(weights, return_rows_slim=True)
+
+        assert np.array_equal(cols_weighted, cols)
+        np.testing.assert_allclose(
+            vals_weighted, vals * weights[rows_slim], rtol=1.0e-15, atol=0.0
+        )
+
+        for return_rows_slim in (True, False):
+            reference = triplets_from(None, return_rows_slim=return_rows_slim)
+            ones = triplets_from(
+                np.ones(mask.pixels_in_mask), return_rows_slim=return_rows_slim
+            )
+
+            for array, array_reference in zip(ones, reference):
+                assert np.array_equal(array, array_reference)
